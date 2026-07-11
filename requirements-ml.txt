@@ -1,0 +1,5 @@
+# Solo para desarrollo local con embeddings SentenceTransformers.
+# En Streamlit Cloud el plan gratis suele quedarse sin memoria con torch.
+sentence-transformers>=3.2.1
+torch>=2.4.1
+torchvision>=0.19.1

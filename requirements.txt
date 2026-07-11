@@ -1,0 +1,25 @@
+# Dependencias para Streamlit Community Cloud (producción).
+# Core UI + config
+streamlit>=1.44.0
+python-dotenv>=1.0.1
+
+# PostgreSQL — OBLIGATORIO binary (compila mal en Linux de Streamlit Cloud)
+psycopg2-binary>=2.9.9
+
+# PDF
+pypdf>=5.5.0
+
+# OpenRouter HTTP + SSL
+requests>=2.32.0
+certifi>=2024.8.30
+truststore>=0.10.0
+
+# ML ligero (anomalias). La calificación semántica pesada es opcional.
+numpy>=1.26.4
+scikit-learn>=1.5.2
+
+# Opcional en local (muy pesado para el plan gratis de Streamlit Cloud).
+# Si lo necesitas en tu PC: pip install -r requirements-ml.txt
+# sentence-transformers>=3.2.1
+# torch>=2.4.1
+# torchvision>=0.19.1
