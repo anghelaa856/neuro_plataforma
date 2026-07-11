@@ -1,4 +1,4 @@
-"""CRUD sobre la tabla memoria_activa."""
+"""CRUD sobre la tabla memoria_activa (scoped por usuario)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from app.infrastructure.database.schema import ensure_schema as ensure_schema_fn
 
 
 class MemoryCardRepository:
-    """Operaciones de lectura/escritura sobre Memoria Activa."""
+    """Operaciones de lectura/escritura sobre Memoria Activa de un usuario."""
 
     def __init__(self, connection: Optional[DatabaseConnection] = None) -> None:
         self._connection = connection or db_connection
@@ -23,6 +23,7 @@ class MemoryCardRepository:
         tema: str,
         pregunta: str,
         respuesta_referencia: str,
+        usuario_id: int,
         respuesta_estudiante: Optional[str] = None,
         nota_ia: Optional[float] = None,
         auditoria_estado: Optional[str] = None,
@@ -40,9 +41,13 @@ class MemoryCardRepository:
         modo_tarjeta: Optional[str] = None,
         nivel_dificultad: Optional[int] = None,
     ) -> int:
-        """Inserta tarjeta evaluada y devuelve su ID."""
+        """Inserta tarjeta del usuario y devuelve su ID."""
+        if usuario_id is None:
+            raise ValueError("usuario_id es obligatorio.")
+
         query = """
         INSERT INTO memoria_activa (
+            usuario_id,
             area,
             tema,
             pregunta,
@@ -64,7 +69,7 @@ class MemoryCardRepository:
             modo_tarjeta,
             nivel_dificultad
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id_tarjeta;
         """
         nivel = 1
@@ -74,6 +79,7 @@ class MemoryCardRepository:
             except (TypeError, ValueError):
                 nivel = 1
         params = (
+            int(usuario_id),
             area,
             tema,
             pregunta,
@@ -103,11 +109,12 @@ class MemoryCardRepository:
                 raise RuntimeError("No se pudo obtener el id_tarjeta luego de insertar.")
             return int(result["id_tarjeta"])
 
-    def fetch_memory_cards(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Recupera tarjetas recientes de memoria activa."""
+    def fetch_memory_cards(self, usuario_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        """Recupera tarjetas recientes del usuario."""
         query = """
         SELECT
             id_tarjeta,
+            usuario_id,
             area,
             tema,
             pregunta,
@@ -130,20 +137,23 @@ class MemoryCardRepository:
             nivel_dificultad,
             creado_en
         FROM memoria_activa
+        WHERE usuario_id = %s
         ORDER BY id_tarjeta DESC
         LIMIT %s;
         """
         with self._connection.get_cursor() as cur:
-            cur.execute(query, (limit,))
+            cur.execute(query, (int(usuario_id), limit))
             return [dict(row) for row in cur.fetchall()]
 
-    def fetch_progress_dashboard(self, due_limit: int = 20) -> Dict[str, Any]:
-        """Resumen de progreso: temas dominados y tarjetas que tocan hoy."""
+    def fetch_progress_dashboard(self, usuario_id: int, due_limit: int = 20) -> Dict[str, Any]:
+        """Resumen de progreso solo del usuario autenticado."""
+        uid = int(usuario_id)
         mastered_query = """
         SELECT COUNT(*) AS temas_dominados
         FROM (
             SELECT COALESCE(NULLIF(TRIM(tema), ''), pregunta) AS tema_key
             FROM memoria_activa
+            WHERE usuario_id = %s
             GROUP BY COALESCE(NULLIF(TRIM(tema), ''), pregunta)
             HAVING AVG(COALESCE(nota_ia, 0)) >= 4.0
         ) t;
@@ -158,14 +168,15 @@ class MemoryCardRepository:
             COALESCE(intervalo_recomendado_dias, 1) AS intervalo_recomendado_dias,
             (DATE(creado_en) + COALESCE(intervalo_recomendado_dias, 1)) AS fecha_repaso
         FROM memoria_activa
-        WHERE (DATE(creado_en) + COALESCE(intervalo_recomendado_dias, 1)) <= CURRENT_DATE
+        WHERE usuario_id = %s
+          AND (DATE(creado_en) + COALESCE(intervalo_recomendado_dias, 1)) <= CURRENT_DATE
         ORDER BY fecha_repaso ASC, id_tarjeta DESC
         LIMIT %s;
         """
         with self._connection.get_cursor() as cur:
-            cur.execute(mastered_query)
+            cur.execute(mastered_query, (uid,))
             mastered_row = cur.fetchone() or {"temas_dominados": 0}
-            cur.execute(due_query, (due_limit,))
+            cur.execute(due_query, (uid, due_limit))
             due_rows = [dict(row) for row in cur.fetchall()]
             cur.execute(
                 """
@@ -173,9 +184,11 @@ class MemoryCardRepository:
                     COALESCE(plan_estudio, 'Sin Plan') AS plan,
                     COUNT(*) AS total
                 FROM memoria_activa
+                WHERE usuario_id = %s
                 GROUP BY COALESCE(plan_estudio, 'Sin Plan')
                 ORDER BY total DESC;
-                """
+                """,
+                (uid,),
             )
             by_plan_rows = [dict(row) for row in cur.fetchall()]
 
@@ -186,8 +199,8 @@ class MemoryCardRepository:
             "por_plan": by_plan_rows,
         }
 
-    def fetch_topic_latest_state(self, tema: str) -> Dict[str, Any]:
-        """Obtiene estado reciente de un tema para decidir madurez y tipo de pregunta."""
+    def fetch_topic_latest_state(self, usuario_id: int, tema: str) -> Dict[str, Any]:
+        """Estado reciente de un tema para el usuario."""
         query = """
         SELECT
             id_tarjeta,
@@ -195,12 +208,13 @@ class MemoryCardRepository:
             COALESCE(repetitions_count, 0) AS repetitions_count,
             COALESCE(easiness_factor, 2.5) AS easiness_factor
         FROM memoria_activa
-        WHERE TRIM(COALESCE(tema, '')) = TRIM(%s)
+        WHERE usuario_id = %s
+          AND TRIM(COALESCE(tema, '')) = TRIM(%s)
         ORDER BY id_tarjeta DESC
         LIMIT 1;
         """
         with self._connection.get_cursor() as cur:
-            cur.execute(query, (tema,))
+            cur.execute(query, (int(usuario_id), tema))
             row = cur.fetchone()
             if not row:
                 return {
@@ -214,16 +228,14 @@ class MemoryCardRepository:
             payload["is_new_topic"] = False
             return payload
 
-    def fetch_due_study_cards(self, limit: int = 20) -> List[Dict[str, Any]]:
-        """
-        Cola de estudio: pendientes (sin respuesta) + vencidas.
-        Devuelve la versión más reciente por (tema, pregunta).
-        """
+    def fetch_due_study_cards(self, usuario_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+        """Cola de estudio del usuario: pendientes + vencidas."""
         query = """
         SELECT *
         FROM (
             SELECT DISTINCT ON (TRIM(COALESCE(tema, '')), TRIM(COALESCE(pregunta, '')))
                 id_tarjeta,
+                usuario_id,
                 area,
                 tema,
                 pregunta,
@@ -241,10 +253,12 @@ class MemoryCardRepository:
                 creado_en,
                 (DATE(creado_en) + COALESCE(intervalo_recomendado_dias, 1)) AS fecha_repaso
             FROM memoria_activa
-            WHERE
+            WHERE usuario_id = %s
+              AND (
                 respuesta_estudiante IS NULL
                 OR TRIM(COALESCE(auditoria_estado, '')) = 'Pendiente'
                 OR (DATE(creado_en) + COALESCE(intervalo_recomendado_dias, 1)) <= CURRENT_DATE
+              )
             ORDER BY
                 TRIM(COALESCE(tema, '')),
                 TRIM(COALESCE(pregunta, '')),
@@ -261,7 +275,7 @@ class MemoryCardRepository:
         LIMIT %s;
         """
         with self._connection.get_cursor() as cur:
-            cur.execute(query, (limit,))
+            cur.execute(query, (int(usuario_id), limit))
             return [dict(row) for row in cur.fetchall()]
 
 

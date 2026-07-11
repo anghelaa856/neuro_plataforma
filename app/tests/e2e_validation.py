@@ -76,7 +76,18 @@ def check_db_and_pipeline_integration() -> None:
     db_manager.connect()
     db_manager.ensure_schema()
 
-    topic_state = db_manager.fetch_topic_latest_state(tema="Validacion Integrada")
+    email = "e2e_validation@example.com"
+    try:
+        user = db_manager.register_user(email=email, password="e2e-secret", nombre="E2E Bot")
+    except ValueError:
+        user = db_manager.authenticate_user(email=email, password="e2e-secret")
+    assert_true(user is not None and "id_usuario" in user, "Could not create/auth E2E user")
+    usuario_id = int(user["id_usuario"])
+
+    topic_state = db_manager.fetch_topic_latest_state(
+        usuario_id=usuario_id,
+        tema="Validacion Integrada",
+    )
     assert_true("is_new_topic" in topic_state, "Topic state did not return expected metadata")
 
     eval_result = evaluate_answer(
@@ -91,6 +102,7 @@ def check_db_and_pipeline_integration() -> None:
 
     run_id = str(uuid.uuid4())
     card_id = db_manager.insert_memory_card(
+        usuario_id=usuario_id,
         area="QA-E2E",
         tema="Validacion Integrada",
         pregunta=f"Smoke test {run_id}",
@@ -112,12 +124,12 @@ def check_db_and_pipeline_integration() -> None:
     )
     assert_true(card_id > 0, "DB insert did not return a valid id")
 
-    cards = db_manager.fetch_memory_cards(limit=100)
+    cards = db_manager.fetch_memory_cards(usuario_id=usuario_id, limit=100)
     assert_true(len(cards) > 0, "DB fetch returned no rows")
     found = any(c.get("pregunta") == f"Smoke test {run_id}" for c in cards)
     assert_true(found, "Inserted E2E row was not found in recent DB rows")
 
-    dashboard = db_manager.fetch_progress_dashboard(due_limit=10)
+    dashboard = db_manager.fetch_progress_dashboard(usuario_id=usuario_id, due_limit=10)
     assert_true("por_plan" in dashboard, "Dashboard missing plan distribution data")
 
     assert_true(eval_result.nota_ia >= 0.0, "Pipeline produced invalid nota_ia")

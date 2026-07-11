@@ -91,6 +91,8 @@ def init_runtime() -> None:
         "plan_estudio": IntervalPolicyService.PLAN_RETENCION,
         "career_hint": "",
         "form_key_counter": 0,
+        # Auth multiusuario
+        "auth_user": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -98,6 +100,95 @@ def init_runtime() -> None:
 
     db_manager.connect()
     db_manager.ensure_schema()
+
+
+def _current_user() -> Optional[Dict[str, Any]]:
+    user = st.session_state.get("auth_user")
+    return user if isinstance(user, dict) and user.get("id_usuario") else None
+
+
+def _require_usuario_id() -> int:
+    user = _current_user()
+    if not user:
+        raise RuntimeError("Debes iniciar sesión.")
+    return int(user["id_usuario"])
+
+
+def _logout() -> None:
+    st.session_state["auth_user"] = None
+    st.session_state["study_queue"] = []
+    st.session_state["study_queue_index"] = 0
+    st.session_state["active_card_id"] = None
+    st.session_state["proposed_cards"] = []
+    st.session_state["mutation_cache"] = {}
+    _reset_answer_controls()
+
+
+def render_auth_gate() -> bool:
+    """
+    Pantalla de Login / Registro.
+    Retorna True si hay sesión activa; False si debe detener el render.
+    """
+    user = _current_user()
+    if user:
+        return True
+
+    st.title("🧠 Sistema de Estudio Inteligente")
+    st.caption("Inicia sesión o crea una cuenta para guardar tu progreso.")
+
+    tab_login, tab_register = st.tabs(["Iniciar sesión", "Registrarse"])
+
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Contraseña", type="password", key="login_password")
+            submitted = st.form_submit_button("Entrar", type="primary", width="stretch")
+        if submitted:
+            try:
+                auth = db_manager.authenticate_user(email=email, password=password)
+                if not auth:
+                    st.error("Email o contraseña incorrectos.")
+                else:
+                    st.session_state["auth_user"] = {
+                        "id_usuario": int(auth["id_usuario"]),
+                        "email": auth["email"],
+                        "nombre": auth["nombre"],
+                    }
+                    st.success(f"Bienvenido/a, {auth['nombre']}.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"No se pudo iniciar sesión: {exc}")
+
+    with tab_register:
+        with st.form("register_form"):
+            nombre = st.text_input("Nombre", key="reg_nombre")
+            email = st.text_input("Email", key="reg_email")
+            password = st.text_input("Contraseña (mín. 6)", type="password", key="reg_password")
+            password2 = st.text_input("Repetir contraseña", type="password", key="reg_password2")
+            submitted = st.form_submit_button("Crear cuenta", type="primary", width="stretch")
+        if submitted:
+            if password != password2:
+                st.error("Las contraseñas no coinciden.")
+            else:
+                try:
+                    created = db_manager.register_user(
+                        email=email,
+                        password=password,
+                        nombre=nombre,
+                    )
+                    st.session_state["auth_user"] = {
+                        "id_usuario": int(created["id_usuario"]),
+                        "email": created["email"],
+                        "nombre": created["nombre"],
+                    }
+                    st.success("Cuenta creada. Ya estás dentro.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"No se pudo registrar: {exc}")
+
+    return False
 
 
 def _reset_answer_controls() -> None:
@@ -125,7 +216,7 @@ def _refresh_study_queue(force: bool = False) -> List[Dict[str, Any]]:
     queue = list(st.session_state.get("study_queue") or [])
     if force or not queue:
         try:
-            queue = db_manager.fetch_due_study_cards(limit=30)
+            queue = db_manager.fetch_due_study_cards(usuario_id=_require_usuario_id(), limit=30)
         except Exception:
             queue = []
         st.session_state["study_queue"] = queue
@@ -205,9 +296,11 @@ def _approve_proposed_cards(
     plan_estudio: str,
     origen_contenido: str,
 ) -> List[int]:
+    usuario_id = _require_usuario_id()
     ids: List[int] = []
     for card in cards:
         card_id = db_manager.insert_memory_card(
+            usuario_id=usuario_id,
             area=card.area,
             tema=card.tema,
             pregunta=card.pregunta,
@@ -397,6 +490,7 @@ def render_study_tab() -> None:
         new_id = None
         try:
             new_id = db_manager.insert_memory_card(
+                usuario_id=_require_usuario_id(),
                 area=area,
                 tema=tema,
                 pregunta=st.session_state.get("active_question_original") or display_q,
@@ -567,7 +661,10 @@ def render_load_tab() -> None:
 def render_dashboard_tab() -> None:
     st.subheader("📊 Dashboard")
     try:
-        dashboard = db_manager.fetch_progress_dashboard(due_limit=20)
+        dashboard = db_manager.fetch_progress_dashboard(
+            usuario_id=_require_usuario_id(),
+            due_limit=20,
+        )
         a, b = st.columns(2)
         a.metric("Temas dominados", dashboard.get("temas_dominados", 0))
         b.metric("Repasos para hoy", dashboard.get("total_repasos_hoy", 0))
@@ -590,7 +687,7 @@ def render_dashboard_tab() -> None:
     st.write("---")
     st.write("**Historial reciente**")
     try:
-        cards = db_manager.fetch_memory_cards(limit=25)
+        cards = db_manager.fetch_memory_cards(usuario_id=_require_usuario_id(), limit=25)
         if cards:
             safe = [{k: c.get(k) for k in STUDENT_HISTORY_COLUMNS if k in c} for c in cards]
             st.dataframe(safe, width="stretch")
@@ -602,8 +699,23 @@ def render_dashboard_tab() -> None:
 
 def build_ui() -> None:
     st.set_page_config(page_title="Sistema de Estudio Inteligente", page_icon="🧠", layout="wide")
-    st.title("🧠 Sistema de Estudio Inteligente")
-    st.caption("Estudio adaptativo · Extracción IA · Memoria Activa (SM-2)")
+
+    if not render_auth_gate():
+        return
+
+    user = _current_user() or {}
+    top_l, top_r = st.columns([3, 1])
+    with top_l:
+        st.title("🧠 Sistema de Estudio Inteligente")
+        st.caption(
+            f"Sesión: **{user.get('nombre', '')}** ({user.get('email', '')}) · "
+            "solo ves y estudias tus propias tarjetas."
+        )
+    with top_r:
+        st.write("")
+        if st.button("Cerrar sesión", width="stretch"):
+            _logout()
+            st.rerun()
 
     tab_study, tab_load, tab_dash = st.tabs(
         ["📚 Estudiar", "➕ Cargar material", "📊 Dashboard"]
