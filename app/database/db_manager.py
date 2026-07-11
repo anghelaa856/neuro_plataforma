@@ -2,6 +2,7 @@
 Alias temporal de compatibilidad.
 
 La implementación real vive en app.infrastructure.database.
+Incluye fachada de Memoria Activa + Usuarios (login/registro).
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from app.infrastructure.database.user_repository import user_repository
 
 
 class DatabaseManager:
-    """Fachada compatible con el antiguo db_manager monolítico."""
+    """Fachada pública: tarjetas + usuarios."""
 
     def connect(self, minconn: int = 1, maxconn: int = 5) -> None:
         db_connection.connect(minconn=minconn, maxconn=maxconn)
@@ -34,6 +35,7 @@ class DatabaseManager:
     def ensure_schema(self) -> None:
         ensure_schema_fn(db_connection)
 
+    # --- Memoria Activa ---
     def insert_memory_card(self, *args: Any, **kwargs: Any) -> int:
         return memory_card_repository.insert_memory_card(*args, **kwargs)
 
@@ -52,14 +54,22 @@ class DatabaseManager:
     def fetch_due_study_cards(self, usuario_id: int, limit: int = 20) -> List[Dict[str, Any]]:
         return memory_card_repository.fetch_due_study_cards(usuario_id=usuario_id, limit=limit)
 
+    # --- Usuarios (multiusuario) ---
     def register_user(self, email: str, password: str, nombre: str) -> Dict[str, Any]:
+        """Registra un usuario nuevo y devuelve {id_usuario, email, nombre, ...}."""
         return user_repository.create_user(email=email, password=password, nombre=nombre)
 
     def authenticate_user(self, email: str, password: str) -> Optional[Dict[str, Any]]:
+        """Valida credenciales. None si fallan."""
         return user_repository.authenticate(email=email, password=password)
 
     def get_user(self, usuario_id: int) -> Optional[Dict[str, Any]]:
+        """Obtiene perfil público por id."""
         return user_repository.get_by_id(usuario_id)
 
 
 db_manager = DatabaseManager()
+
+# Garantiza que la instancia expone auth aunque haya caché rara de import.
+assert hasattr(db_manager, "register_user"), "DatabaseManager sin register_user"
+assert hasattr(db_manager, "authenticate_user"), "DatabaseManager sin authenticate_user"

@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.database.db_manager import db_manager
+from app.infrastructure.database.user_repository import user_repository
 from app.ml.interval_policy import IntervalPolicyService
 from app.services.content_service import (
     ExtractedCard,
@@ -145,7 +146,7 @@ def render_auth_gate() -> bool:
             submitted = st.form_submit_button("Entrar", type="primary", width="stretch")
         if submitted:
             try:
-                auth = db_manager.authenticate_user(email=email, password=password)
+                auth = user_repository.authenticate(email=email, password=password)
                 if not auth:
                     st.error("Email o contraseña incorrectos.")
                 else:
@@ -171,7 +172,7 @@ def render_auth_gate() -> bool:
                 st.error("Las contraseñas no coinciden.")
             else:
                 try:
-                    created = db_manager.register_user(
+                    created = user_repository.create_user(
                         email=email,
                         password=password,
                         nombre=nombre,
