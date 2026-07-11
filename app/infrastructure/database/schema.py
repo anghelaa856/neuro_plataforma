@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from app.infrastructure.database.connection import DatabaseConnection, db_connection
+
+logger = logging.getLogger(__name__)
 
 CREATE_USUARIOS = """
 CREATE TABLE IF NOT EXISTS usuarios (
@@ -14,10 +18,12 @@ CREATE TABLE IF NOT EXISTS usuarios (
 );
 """
 
+# Sin FK inline: la tabla puede existir desde deploys previos sin usuarios.
+# La FK se agrega después en migraciones, una vez que usuarios existe.
 CREATE_MEMORIA_ACTIVA = """
 CREATE TABLE IF NOT EXISTS memoria_activa (
     id_tarjeta BIGSERIAL PRIMARY KEY,
-    usuario_id BIGINT REFERENCES usuarios(id_usuario) ON DELETE CASCADE,
+    usuario_id BIGINT,
     area VARCHAR(120),
     tema VARCHAR(200),
     pregunta TEXT,
@@ -43,8 +49,6 @@ CREATE TABLE IF NOT EXISTS memoria_activa (
 """
 
 MIGRATION_STATEMENTS = [
-    "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS id_tarjeta BIGSERIAL;",
-    "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS usuario_id BIGINT;",
     "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS area VARCHAR(120);",
     "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS tema VARCHAR(200);",
     "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS pregunta TEXT;",
@@ -66,6 +70,8 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS modo_tarjeta VARCHAR(20) DEFAULT 'concepto';",
     "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS nivel_dificultad INTEGER DEFAULT 1;",
     "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP;",
+    # Vínculo multiusuario (obligatorio)
+    "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS usuario_id BIGINT;",
     """
     DO $$
     BEGIN
@@ -80,6 +86,7 @@ MIGRATION_STATEMENTS = [
     EXCEPTION
         WHEN undefined_table THEN NULL;
         WHEN duplicate_object THEN NULL;
+        WHEN others THEN NULL;
     END $$;
     """,
     "CREATE INDEX IF NOT EXISTS idx_memoria_activa_usuario_id ON memoria_activa(usuario_id);",
@@ -87,11 +94,41 @@ MIGRATION_STATEMENTS = [
 ]
 
 
+def _run_sql(connection: DatabaseConnection, sql: str, *, critical: bool = False) -> None:
+    """
+    Ejecuta DDL en su propia transacción.
+    Así un ALTER fallido NO hace rollback del CREATE TABLE usuarios.
+    """
+    try:
+        with connection.get_cursor() as cur:
+            cur.execute(sql)
+    except Exception as exc:
+        if critical:
+            raise
+        logger.warning("DDL no crítico omitido: %s | sql=%s", exc, " ".join(sql.split())[:120])
+
+
 def ensure_schema(connection: DatabaseConnection | None = None) -> None:
-    """Crea/migra usuarios y memoria_activa."""
+    """
+    Crea/migra:
+    1) tabla usuarios
+    2) tabla memoria_activa
+    3) columna usuario_id + FK/índices
+    """
     conn = connection or db_connection
-    with conn.get_cursor() as cur:
-        cur.execute(CREATE_USUARIOS)
-        cur.execute(CREATE_MEMORIA_ACTIVA)
-        for stmt in MIGRATION_STATEMENTS:
-            cur.execute(stmt)
+
+    # 1) Usuarios — crítico para login/registro
+    _run_sql(conn, CREATE_USUARIOS, critical=True)
+    logger.info("Esquema: tabla usuarios OK")
+
+    # 2) Memoria activa
+    _run_sql(conn, CREATE_MEMORIA_ACTIVA, critical=True)
+    logger.info("Esquema: tabla memoria_activa OK")
+
+    # 3) Migraciones (incluyen usuario_id)
+    for stmt in MIGRATION_STATEMENTS:
+        # usuario_id debe aplicarse sí o sí
+        critical = "usuario_id" in stmt and "ADD COLUMN" in stmt.upper()
+        _run_sql(conn, stmt, critical=critical)
+
+    logger.info("Esquema: migraciones memoria_activa/usuarios aplicadas")

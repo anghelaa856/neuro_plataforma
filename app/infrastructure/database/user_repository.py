@@ -44,6 +44,11 @@ class UserRepository:
         return hmac.compare_digest(candidate, stored)
 
     def create_user(self, email: str, password: str, nombre: str) -> Dict[str, Any]:
+        # Garantiza que la tabla exista aunque el deploy anterior no migró.
+        from app.infrastructure.database.schema import ensure_schema
+
+        ensure_schema(self._connection)
+
         email_n = self._normalize_email(email)
         nombre_n = " ".join((nombre or "").strip().split())
         if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_n):
@@ -67,8 +72,10 @@ class UserRepository:
                     raise RuntimeError("No se pudo crear el usuario.")
                 return dict(row)
         except Exception as exc:
+            # Postgres puede devolver el mensaje en español ("unicidad") o inglés ("unique").
+            pgcode = getattr(exc, "pgcode", None)
             msg = str(exc).lower()
-            if "unique" in msg or "duplicate" in msg:
+            if pgcode == "23505" or "unique" in msg or "unicidad" in msg or "duplicate" in msg:
                 raise ValueError("Ya existe una cuenta con ese email.") from exc
             raise
 
