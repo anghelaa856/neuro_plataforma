@@ -67,9 +67,17 @@ class MemoryCardRepository:
             repetitions_count,
             easiness_factor,
             modo_tarjeta,
-            nivel_dificultad
+            nivel_dificultad,
+            proxima_revision
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            CASE
+                WHEN %s IS NULL OR TRIM(COALESCE(%s, '')) = 'Pendiente'
+                    THEN CURRENT_DATE
+                ELSE CURRENT_DATE + GREATEST(COALESCE(%s, 1), 1)
+            END
+        )
         RETURNING id_tarjeta;
         """
         nivel = 1
@@ -78,6 +86,11 @@ class MemoryCardRepository:
                 nivel = max(1, min(3, int(nivel_dificultad)))
             except (TypeError, ValueError):
                 nivel = 1
+        intervalo = (
+            max(1, int(intervalo_recomendado_dias))
+            if intervalo_recomendado_dias is not None
+            else 1
+        )
         params = (
             int(usuario_id),
             area,
@@ -100,6 +113,9 @@ class MemoryCardRepository:
             easiness_factor,
             (modo_tarjeta or "concepto").strip().lower() or "concepto",
             nivel,
+            respuesta_estudiante,
+            auditoria_estado,
+            intervalo,
         )
 
         with self._connection.get_cursor() as cur:
@@ -166,11 +182,33 @@ class MemoryCardRepository:
             pregunta,
             creado_en,
             COALESCE(intervalo_recomendado_dias, 1) AS intervalo_recomendado_dias,
-            (DATE(creado_en) + COALESCE(intervalo_recomendado_dias, 1)) AS fecha_repaso
-        FROM memoria_activa
-        WHERE usuario_id = %s
-          AND (DATE(creado_en) + COALESCE(intervalo_recomendado_dias, 1)) <= CURRENT_DATE
-        ORDER BY fecha_repaso ASC, id_tarjeta DESC
+            fecha_repaso
+        FROM (
+            SELECT DISTINCT ON (TRIM(COALESCE(tema, '')), TRIM(COALESCE(pregunta, '')))
+                id_tarjeta,
+                area,
+                tema,
+                pregunta,
+                creado_en,
+                COALESCE(intervalo_recomendado_dias, 1) AS intervalo_recomendado_dias,
+                respuesta_estudiante,
+                auditoria_estado,
+                COALESCE(
+                    proxima_revision,
+                    DATE(creado_en) + COALESCE(intervalo_recomendado_dias, 1)
+                ) AS fecha_repaso
+            FROM memoria_activa
+            WHERE usuario_id = %s
+            ORDER BY
+                TRIM(COALESCE(tema, '')),
+                TRIM(COALESCE(pregunta, '')),
+                id_tarjeta DESC
+        ) q
+        WHERE
+            q.respuesta_estudiante IS NULL
+            OR TRIM(COALESCE(q.auditoria_estado, '')) = 'Pendiente'
+            OR q.fecha_repaso <= CURRENT_DATE
+        ORDER BY q.fecha_repaso ASC NULLS FIRST, q.id_tarjeta DESC
         LIMIT %s;
         """
         with self._connection.get_cursor() as cur:
@@ -229,7 +267,13 @@ class MemoryCardRepository:
             return payload
 
     def fetch_due_study_cards(self, usuario_id: int, limit: int = 20) -> List[Dict[str, Any]]:
-        """Cola de estudio del usuario: pendientes + vencidas."""
+        """
+        Cola de estudio del usuario: pendientes + vencidas.
+
+        IMPORTANTE: primero se toma el ÚLTIMO estado por (tema, pregunta) del usuario
+        y DESPUÉS se filtra por vencimiento. Si se filtrara antes, las filas antiguas
+        'Pendiente' seguirían apareciendo aunque ya hubiera un repaso con intervalo futuro.
+        """
         query = """
         SELECT *
         FROM (
@@ -251,19 +295,21 @@ class MemoryCardRepository:
                 origen_contenido,
                 auditoria_estado,
                 creado_en,
-                (DATE(creado_en) + COALESCE(intervalo_recomendado_dias, 1)) AS fecha_repaso
+                COALESCE(
+                    proxima_revision,
+                    DATE(creado_en) + COALESCE(intervalo_recomendado_dias, 1)
+                ) AS fecha_repaso
             FROM memoria_activa
             WHERE usuario_id = %s
-              AND (
-                respuesta_estudiante IS NULL
-                OR TRIM(COALESCE(auditoria_estado, '')) = 'Pendiente'
-                OR (DATE(creado_en) + COALESCE(intervalo_recomendado_dias, 1)) <= CURRENT_DATE
-              )
             ORDER BY
                 TRIM(COALESCE(tema, '')),
                 TRIM(COALESCE(pregunta, '')),
                 id_tarjeta DESC
         ) q
+        WHERE
+            q.respuesta_estudiante IS NULL
+            OR TRIM(COALESCE(q.auditoria_estado, '')) = 'Pendiente'
+            OR q.fecha_repaso <= CURRENT_DATE
         ORDER BY
             CASE
                 WHEN q.respuesta_estudiante IS NULL THEN 0
@@ -277,6 +323,63 @@ class MemoryCardRepository:
         with self._connection.get_cursor() as cur:
             cur.execute(query, (int(usuario_id), limit))
             return [dict(row) for row in cur.fetchall()]
+
+    def record_study_response(
+        self,
+        *,
+        id_tarjeta: int,
+        usuario_id: int,
+        respuesta_estudiante: str,
+        nota_ia: Optional[float],
+        auditoria_estado: Optional[str],
+        auditoria_tiempo_ms: Optional[int],
+        intervalo_recomendado_dias: int,
+        plan_estudio: Optional[str],
+        repetitions_count: int,
+        easiness_factor: float,
+    ) -> int:
+        """
+        Persiste el repaso SOBRE la tarjeta existente del usuario.
+        Actualiza progreso SM-2 y proxima_revision para que no se reinicie al reentrar.
+        """
+        query = """
+        UPDATE memoria_activa
+        SET
+            respuesta_estudiante = %s,
+            nota_ia = %s,
+            auditoria_estado = %s,
+            auditoria_tiempo_ms = %s,
+            intervalo_recomendado_dias = %s,
+            plan_estudio = COALESCE(%s, plan_estudio),
+            repetitions_count = %s,
+            easiness_factor = %s,
+            proxima_revision = CURRENT_DATE + GREATEST(COALESCE(%s, 1), 1)
+        WHERE id_tarjeta = %s
+          AND usuario_id = %s
+        RETURNING id_tarjeta;
+        """
+        intervalo = max(1, int(intervalo_recomendado_dias or 1))
+        params = (
+            respuesta_estudiante,
+            nota_ia,
+            auditoria_estado,
+            auditoria_tiempo_ms,
+            intervalo,
+            plan_estudio,
+            int(repetitions_count),
+            float(easiness_factor),
+            intervalo,
+            int(id_tarjeta),
+            int(usuario_id),
+        )
+        with self._connection.get_cursor() as cur:
+            cur.execute(query, params)
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError(
+                    "No se actualizó la tarjeta: id inválido o no pertenece al usuario."
+                )
+            return int(row["id_tarjeta"])
 
 
 memory_card_repository = MemoryCardRepository()

@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS memoria_activa (
     easiness_factor NUMERIC(6, 3),
     modo_tarjeta VARCHAR(20) DEFAULT 'concepto',
     nivel_dificultad INTEGER DEFAULT 1,
+    proxima_revision DATE,
     creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -72,6 +73,8 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP;",
     # Vínculo multiusuario (obligatorio)
     "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS usuario_id BIGINT;",
+    # Fecha de próximo repaso (persiste progreso SM-2 entre sesiones)
+    "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS proxima_revision DATE;",
     """
     DO $$
     BEGIN
@@ -90,7 +93,18 @@ MIGRATION_STATEMENTS = [
     END $$;
     """,
     "CREATE INDEX IF NOT EXISTS idx_memoria_activa_usuario_id ON memoria_activa(usuario_id);",
+    "CREATE INDEX IF NOT EXISTS idx_memoria_activa_proxima_revision ON memoria_activa(proxima_revision);",
     "CREATE INDEX IF NOT EXISTS idx_usuarios_email ON usuarios(email);",
+    # Tarjetas pendientes/heredadas sin fecha: due hoy
+    """
+    UPDATE memoria_activa
+    SET proxima_revision = CURRENT_DATE
+    WHERE proxima_revision IS NULL
+      AND (
+        respuesta_estudiante IS NULL
+        OR TRIM(COALESCE(auditoria_estado, '')) = 'Pendiente'
+      );
+    """,
 ]
 
 

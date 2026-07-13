@@ -54,6 +54,10 @@ class DatabaseManager:
     def fetch_due_study_cards(self, usuario_id: int, limit: int = 20) -> List[Dict[str, Any]]:
         return memory_card_repository.fetch_due_study_cards(usuario_id=usuario_id, limit=limit)
 
+    def record_study_response(self, *args: Any, **kwargs: Any) -> int:
+        """Actualiza el progreso de una tarjeta existente del usuario autenticado."""
+        return memory_card_repository.record_study_response(*args, **kwargs)
+
     # --- Usuarios (multiusuario) ---
     def register_user(self, email: str, password: str, nombre: str) -> Dict[str, Any]:
         """Registra un usuario nuevo y devuelve {id_usuario, email, nombre, ...}."""

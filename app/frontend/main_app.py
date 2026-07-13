@@ -84,6 +84,7 @@ def init_runtime() -> None:
         "study_queue": [],
         "study_queue_index": 0,
         "study_queue_loaded_at": None,
+        "study_queue_owner_id": None,
         # Carga / extracción
         "pdf_text": "",
         "proposed_cards": [],
@@ -94,6 +95,7 @@ def init_runtime() -> None:
         "form_key_counter": 0,
         # Auth multiusuario
         "auth_user": None,
+        "usuario_id": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -112,13 +114,37 @@ def _require_usuario_id() -> int:
     user = _current_user()
     if not user:
         raise RuntimeError("Debes iniciar sesión.")
-    return int(user["id_usuario"])
+    uid = int(user["id_usuario"])
+    st.session_state["usuario_id"] = uid
+    return uid
+
+
+def _establish_user_session(auth: Dict[str, Any]) -> None:
+    """Guarda el usuario en session_state y limpia cola de estudio ajena."""
+    uid = int(auth["id_usuario"])
+    st.session_state["auth_user"] = {
+        "id_usuario": uid,
+        "email": auth["email"],
+        "nombre": auth["nombre"],
+    }
+    st.session_state["usuario_id"] = uid
+    st.session_state["study_queue"] = []
+    st.session_state["study_queue_index"] = 0
+    st.session_state["study_queue_owner_id"] = None
+    st.session_state["study_queue_loaded_at"] = None
+    st.session_state["active_card_id"] = None
+    st.session_state["mutation_cache"] = {}
+    st.session_state["proposed_cards"] = []
+    _reset_answer_controls()
 
 
 def _logout() -> None:
     st.session_state["auth_user"] = None
+    st.session_state["usuario_id"] = None
     st.session_state["study_queue"] = []
     st.session_state["study_queue_index"] = 0
+    st.session_state["study_queue_owner_id"] = None
+    st.session_state["study_queue_loaded_at"] = None
     st.session_state["active_card_id"] = None
     st.session_state["proposed_cards"] = []
     st.session_state["mutation_cache"] = {}
@@ -150,11 +176,7 @@ def render_auth_gate() -> bool:
                 if not auth:
                     st.error("Email o contraseña incorrectos.")
                 else:
-                    st.session_state["auth_user"] = {
-                        "id_usuario": int(auth["id_usuario"]),
-                        "email": auth["email"],
-                        "nombre": auth["nombre"],
-                    }
+                    _establish_user_session(auth)
                     st.success(f"Bienvenido/a, {auth['nombre']}.")
                     st.rerun()
             except Exception as exc:
@@ -177,11 +199,7 @@ def render_auth_gate() -> bool:
                         password=password,
                         nombre=nombre,
                     )
-                    st.session_state["auth_user"] = {
-                        "id_usuario": int(created["id_usuario"]),
-                        "email": created["email"],
-                        "nombre": created["nombre"],
-                    }
+                    _establish_user_session(created)
                     st.success("Cuenta creada. Ya estás dentro.")
                     st.rerun()
                 except ValueError as exc:
@@ -213,15 +231,21 @@ def _bump_answer_form_key() -> None:
 
 
 def _refresh_study_queue(force: bool = False) -> List[Dict[str, Any]]:
-    """Carga/recarga la cola de repasos sin romper la sesión al cambiar de pestaña."""
+    """Carga/recarga la cola de repasos del usuario logueado."""
+    usuario_id = _require_usuario_id()
+    owner = st.session_state.get("study_queue_owner_id")
+    if owner is not None and int(owner) != usuario_id:
+        force = True
+
     queue = list(st.session_state.get("study_queue") or [])
     if force or not queue:
         try:
-            queue = db_manager.fetch_due_study_cards(usuario_id=_require_usuario_id(), limit=30)
+            queue = db_manager.fetch_due_study_cards(usuario_id=usuario_id, limit=30)
         except Exception:
             queue = []
         st.session_state["study_queue"] = queue
         st.session_state["study_queue_index"] = 0
+        st.session_state["study_queue_owner_id"] = usuario_id
         st.session_state["study_queue_loaded_at"] = time.time()
     return queue
 
@@ -488,36 +512,31 @@ def render_study_tab() -> None:
             study_plan=st.session_state.get("plan_estudio", IntervalPolicyService.PLAN_RETENCION),
         )
 
-        new_id = None
+        saved_id = None
+        card_id = st.session_state.get("active_card_id")
         try:
-            new_id = db_manager.insert_memory_card(
+            if not card_id:
+                raise RuntimeError("No hay tarjeta activa para guardar el repaso.")
+            saved_id = db_manager.record_study_response(
+                id_tarjeta=int(card_id),
                 usuario_id=_require_usuario_id(),
-                area=area,
-                tema=tema,
-                pregunta=st.session_state.get("active_question_original") or display_q,
-                respuesta_referencia=reference,
                 respuesta_estudiante=pending,
                 nota_ia=result.nota_ia,
                 auditoria_estado=result.auditoria_estado,
                 auditoria_tiempo_ms=result.auditoria_tiempo_ms,
                 intervalo_recomendado_dias=result.intervalo_dias,
                 plan_estudio=st.session_state.get("plan_estudio"),
-                tipo_pregunta="open",
-                modo_simulacro=False,
-                origen_contenido="estudio",
                 repetitions_count=result.repetitions,
                 easiness_factor=result.easiness,
-                modo_tarjeta=modo,
-                nivel_dificultad=nivel,
             )
-        except Exception:
-            st.error("No se pudo guardar el repaso en PostgreSQL.")
+        except Exception as exc:
+            st.error(f"No se pudo guardar el repaso en PostgreSQL: {exc}")
 
         st.session_state["answer_submitted"] = True
         st.session_state["session_locked"] = False
         st.session_state["question_started_at"] = None
         st.session_state["last_evaluation"] = result
-        st.session_state["last_card_id"] = new_id
+        st.session_state["last_card_id"] = saved_id
         st.session_state["last_reference_text"] = reference
         # Limpia mutación de esta tarjeta para el próximo ciclo.
         cache = dict(st.session_state.get("mutation_cache") or {})
