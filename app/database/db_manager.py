@@ -3,10 +3,13 @@ Alias temporal de compatibilidad.
 
 La implementación real vive en app.infrastructure.database.
 Incluye fachada de Memoria Activa + Usuarios (login/registro).
+
+La conexión a PostgreSQL usa únicamente DATABASE_URL (DSN completo).
 """
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, List, Optional
 
@@ -16,12 +19,20 @@ from app.infrastructure.database.connection import db_connection
 from app.infrastructure.database.repositories import memory_card_repository
 from app.infrastructure.database.schema import ensure_schema as ensure_schema_fn
 from app.infrastructure.database.user_repository import user_repository
+from config.settings import settings
 
 
 class DatabaseManager:
     """Fachada pública: tarjetas + usuarios."""
 
     def connect(self, minconn: int = 1, maxconn: int = 5) -> None:
+        """Abre el pool usando DATABASE_URL (link completo de Neon/PostgreSQL)."""
+        database_url = (settings.database_url or os.getenv("DATABASE_URL", "")).strip()
+        if not database_url:
+            raise RuntimeError(
+                "DATABASE_URL no está definida. "
+                "Configura el link completo de conexión en Secrets o .env."
+            )
         db_connection.connect(minconn=minconn, maxconn=maxconn)
 
     def close(self) -> None:

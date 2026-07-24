@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from contextlib import contextmanager
 from typing import Generator, Optional
+from urllib.parse import urlparse
 
-from psycopg2 import OperationalError, pool
+from psycopg2 import OperationalError
 from psycopg2.extensions import connection as PgConnection
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import PoolError, ThreadedConnectionPool
@@ -17,11 +19,24 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 
+def _resolve_database_url() -> str:
+    """Obtiene el DSN completo desde DATABASE_URL (.env / Secrets / entorno)."""
+    url = (settings.database_url or os.getenv("DATABASE_URL", "")).strip()
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL no está definida. "
+            "Configura el link completo de Neon/PostgreSQL en Secrets o en .env "
+            "(ej. postgresql://user:pass@host/db?sslmode=require)."
+        )
+    return url
+
+
 class DatabaseConnection:
     """
-    Pool thread-safe para entornos como Streamlit Cloud.
+    Pool thread-safe para entornos como Streamlit Cloud / Hugging Face Spaces.
 
     - Usa ThreadedConnectionPool (SimpleConnectionPool NO es thread-safe).
+    - Conecta solo con DATABASE_URL (DSN completo), sin host/puerto/user sueltos.
     - Devuelve conexiones con putconn seguro (evita 'unkeyed connection').
     - Descarta conexiones muertas (Neon cierra idle connections).
     """
@@ -36,7 +51,7 @@ class DatabaseConnection:
             if self._pool is not None and not getattr(self._pool, "closed", True):
                 return
 
-            db_config = settings.postgres_config()
+            database_url = _resolve_database_url()
             # Cierra pool previo a medias si quedó inconsistente tras un redeploy.
             if self._pool is not None:
                 try:
@@ -45,11 +60,11 @@ class DatabaseConnection:
                     pass
                 self._pool = None
 
-            self._pool = ThreadedConnectionPool(minconn, maxconn, **db_config)
+            self._pool = ThreadedConnectionPool(minconn, maxconn, dsn=database_url)
+            parsed = urlparse(database_url)
             logger.info(
-                "Pool PostgreSQL (Threaded) listo host=%s sslmode=%s maxconn=%s",
-                db_config.get("host", "?"),
-                db_config.get("sslmode", "disable"),
+                "Pool PostgreSQL (Threaded) listo host=%s maxconn=%s (DATABASE_URL)",
+                parsed.hostname or "?",
                 maxconn,
             )
 
