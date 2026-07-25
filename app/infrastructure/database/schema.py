@@ -1,9 +1,10 @@
-"""Creación y migración del esquema (usuarios + Memoria Activa)."""
+"""Creación y migración del esquema (usuarios + Memoria Activa + Admisión UNA)."""
 
 from __future__ import annotations
 
 import logging
 
+from app.infrastructure.database.admission_schema import ensure_admission_schema
 from app.infrastructure.database.connection import DatabaseConnection, db_connection
 
 logger = logging.getLogger(__name__)
@@ -126,8 +127,9 @@ def ensure_schema(connection: DatabaseConnection | None = None) -> None:
     """
     Crea/migra:
     1) tabla usuarios
-    2) tabla memoria_activa
-    3) columna usuario_id + FK/índices
+    2) tabla memoria_activa (heredada; no se modifica su forma productiva)
+    3) columna usuario_id + FK/índices de Memoria Activa
+    4) dominio Admisión UNA (5 tablas + vistas) — sin tocar memoria_activa
     """
     conn = connection or db_connection
 
@@ -146,3 +148,8 @@ def ensure_schema(connection: DatabaseConnection | None = None) -> None:
         _run_sql(conn, stmt, critical=critical)
 
     logger.info("Esquema: migraciones memoria_activa/usuarios aplicadas")
+
+    # 4) Simulador de admisión (catalogo / temas / banco / sesiones / historial)
+    #    Aislado: solo CREATE IF NOT EXISTS + seeds idempotentes del DDL.
+    ensure_admission_schema(conn)
+    logger.info("Esquema: dominio admisión UNA materializado (memoria_activa intacta)")

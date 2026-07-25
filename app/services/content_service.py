@@ -387,6 +387,22 @@ def cards_to_table_rows(cards: List[ExtractedCard]) -> List[Dict[str, Any]]:
     return [card.to_dict() for card in cards]
 
 
+# ---------------------------------------------------------------------------
+# Puente hacia la bóveda UNA (MCQ A..E → temas_estudio + banco_preguntas)
+# ---------------------------------------------------------------------------
+def extract_banco_from_chunks(chunks: List[str], materia_id: int, **kwargs: Any) -> Any:
+    """
+    Extracción estricta de ítems de admisión UNA desde chunks limpios.
+
+    Delega en ``banco_extraction_service`` (prompt cerrado A..E + Pydantic +
+    persistencia transaccional). Preferir importar directamente ese módulo
+    en código nuevo.
+    """
+    from app.services.banco_extraction_service import extract_banco_preguntas_from_chunks
+
+    return extract_banco_preguntas_from_chunks(chunks, materia_id, **kwargs)
+
+
 @dataclass
 class MutationResult:
     pregunta_mutada: str

@@ -1,24 +1,33 @@
-# Dependencias para Streamlit Community Cloud (producción).
+# Dependencias para Hugging Face Spaces / Streamlit (producción).
 # Core UI + config
 streamlit>=1.44.0
 python-dotenv>=1.0.1
 
-# PostgreSQL — OBLIGATORIO binary (compila mal en Linux de Streamlit Cloud)
+# PostgreSQL — OBLIGATORIO binary (compila mal en Linux slim sin headers)
 psycopg2-binary>=2.9.9
+# Capa ORM opcional (el runtime actual usa psycopg2; SQLAlchemy queda disponible)
+SQLAlchemy>=2.0.36
 
-# PDF
+# PDF — nativo + PyMuPDF (fitz) para PDFs sucios
 pypdf>=5.5.0
+pymupdf>=1.24.0
+
+# OCR (fallback escaneados). En HF sin poppler/tesseract el pipeline degrada a nativo.
+pdf2image>=1.17.0
+pytesseract>=0.3.10
+Pillow>=10.4.0
 
 # OpenRouter HTTP + SSL
 requests>=2.32.0
 certifi>=2024.8.30
 truststore>=0.10.0
 
-# ML ligero (anomalias). La calificación semántica pesada es opcional.
+# ML ligero + analytics del TutorEngine
 numpy>=1.26.4
 scikit-learn>=1.5.2
+pandas>=2.2.0
 
-# Opcional en local (muy pesado para el plan gratis de Streamlit Cloud).
+# Opcional en local (muy pesado para el plan gratis de Spaces).
 # Si lo necesitas en tu PC: pip install -r requirements-ml.txt
 # sentence-transformers>=3.2.1
 # torch>=2.4.1

@@ -1,19 +1,20 @@
 import sys
 import time
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
-from pypdf import PdfReader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.database.db_manager import db_manager
+from app.infrastructure.database.banco_repository import banco_repository
+from app.infrastructure.database.seed_catalogo_materias import seed_catalogo_materias
 from app.infrastructure.database.user_repository import user_repository
 from app.ml.interval_policy import IntervalPolicyService
+from app.services.banco_extraction_service import extract_banco_preguntas_from_chunks
 from app.services.content_service import (
     ExtractedCard,
     cards_to_table_rows,
@@ -21,6 +22,12 @@ from app.services.content_service import (
     mutate_question_for_review,
 )
 from app.services.evaluation_service import EvaluationResult, evaluate_answer, interval_policy
+from app.services.pdf_processor import process_pdf
+from app.services.tutor_engine import (
+    BancoInsuficienteError,
+    CatalogoInvalidoError,
+    tutor_engine,
+)
 
 STUDENT_HISTORY_COLUMNS = [
     "id_tarjeta",
@@ -49,13 +56,9 @@ DUE_COLUMNS = [
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    reader = PdfReader(BytesIO(file_bytes))
-    chunks: List[str] = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        if text.strip():
-            chunks.append(text)
-    return "\n".join(chunks).strip()
+    """Compat: aduana de limpieza completa; devuelve texto cosido."""
+    doc = process_pdf(file_bytes, allow_ocr=True)
+    return doc.text
 
 
 def init_runtime() -> None:
@@ -87,6 +90,9 @@ def init_runtime() -> None:
         "study_queue_owner_id": None,
         # Carga / extracción
         "pdf_text": "",
+        "pdf_chunks": [],
+        "pdf_method": "",
+        "pdf_warnings": [],
         "proposed_cards": [],
         "extraction_detail": "",
         "extraction_source": "",
@@ -96,6 +102,14 @@ def init_runtime() -> None:
         # Auth multiusuario
         "auth_user": None,
         "usuario_id": None,
+        # UNA — Ingesta / Simulacro / Práctica
+        "ingesta_last_result": None,
+        "simulacro_activo": None,
+        "simulacro_index": 0,
+        "simulacro_respuestas": {},
+        "practica_activa": None,
+        "practica_index": 0,
+        "practica_respuestas": {},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -103,6 +117,11 @@ def init_runtime() -> None:
 
     db_manager.connect()
     db_manager.ensure_schema()
+    try:
+        seed_catalogo_materias(ensure_schema_first=False)
+    except Exception:
+        # Catálogo puede venir del DDL; no bloquear la UI
+        pass
 
 
 def _current_user() -> Optional[Dict[str, Any]]:
@@ -117,6 +136,19 @@ def _require_usuario_id() -> int:
     uid = int(user["id_usuario"])
     st.session_state["usuario_id"] = uid
     return uid
+
+
+def _effective_usuario_id() -> int:
+    """
+    Usuario autenticado si hay sesión; si no, fallback a 1 (modo demo HF).
+    """
+    user = _current_user()
+    if user and user.get("id_usuario"):
+        uid = int(user["id_usuario"])
+        st.session_state["usuario_id"] = uid
+        return uid
+    st.session_state["usuario_id"] = 1
+    return 1
 
 
 def _establish_user_session(auth: Dict[str, Any]) -> None:
@@ -603,19 +635,37 @@ def render_load_tab() -> None:
 
     if uploaded_pdf is not None and not st.session_state.get("pdf_text"):
         try:
-            pdf_text = extract_text_from_pdf(uploaded_pdf.read())
-            if pdf_text:
-                st.session_state["pdf_text"] = pdf_text
-                st.success("PDF procesado.")
+            doc = process_pdf(uploaded_pdf.read(), allow_ocr=True)
+            if doc.text:
+                st.session_state["pdf_text"] = doc.text
+                st.session_state["pdf_chunks"] = doc.chunks
+                st.session_state["pdf_method"] = doc.method
+                st.session_state["pdf_warnings"] = doc.warnings
+                st.success(
+                    f"PDF procesado ({doc.method}): {doc.page_count} págs, "
+                    f"{len(doc.chunks)} fragmentos, {doc.chars_per_page:.0f} chars/pág."
+                )
+                for warn in doc.warnings:
+                    st.caption(f"⚠️ {warn}")
             else:
-                st.warning("PDF sin texto legible.")
+                st.warning("PDF sin texto legible (¿escaneado sin OCR instalado?).")
+                for warn in doc.warnings:
+                    st.caption(f"⚠️ {warn}")
         except Exception:
             st.error("No se pudo leer el PDF.")
 
     if st.session_state.get("pdf_text"):
-        st.caption(f"PDF en memoria: {len(st.session_state['pdf_text'])} caracteres")
+        method = st.session_state.get("pdf_method") or "?"
+        n_chunks = len(st.session_state.get("pdf_chunks") or [])
+        st.caption(
+            f"PDF en memoria: {len(st.session_state['pdf_text'])} caracteres · "
+            f"método={method} · chunks={n_chunks}"
+        )
         if st.button("Quitar PDF"):
             st.session_state["pdf_text"] = ""
+            st.session_state["pdf_chunks"] = []
+            st.session_state["pdf_method"] = ""
+            st.session_state["pdf_warnings"] = []
             st.rerun()
 
     chunks: List[str] = []
@@ -718,7 +768,11 @@ def render_dashboard_tab() -> None:
 
 
 def build_ui() -> None:
-    st.set_page_config(page_title="Sistema de Estudio Inteligente", page_icon="🧠", layout="wide")
+    st.set_page_config(
+        page_title="Neuro Plataforma · Admisión UNA",
+        page_icon="🧠",
+        layout="wide",
+    )
 
     if not render_auth_gate():
         return
@@ -726,10 +780,10 @@ def build_ui() -> None:
     user = _current_user() or {}
     top_l, top_r = st.columns([3, 1])
     with top_l:
-        st.title("🧠 Sistema de Estudio Inteligente")
+        st.title("🧠 Neuro Plataforma — Admisión UNA Biomédicas")
         st.caption(
             f"Sesión: **{user.get('nombre', '')}** ({user.get('email', '')}) · "
-            "solo ves y estudias tus propias tarjetas."
+            "TutorEngine · bóveda Neon · OpenRouter"
         )
     with top_r:
         st.write("")
@@ -737,15 +791,332 @@ def build_ui() -> None:
             _logout()
             st.rerun()
 
-    tab_study, tab_load, tab_dash = st.tabs(
-        ["📚 Estudiar", "➕ Cargar material", "📊 Dashboard"]
+    tab_ingesta, tab_simulacro, tab_practica = st.tabs(
+        [
+            "📥 Ingesta de Material (Admin)",
+            "📝 Simulacro Oficial UNA (120 min)",
+            "🎯 Práctica Enfocada",
+        ]
     )
-    with tab_study:
-        render_study_tab()
-    with tab_load:
-        render_load_tab()
-    with tab_dash:
-        render_dashboard_tab()
+    with tab_ingesta:
+        render_ingesta_admin_tab()
+    with tab_simulacro:
+        render_simulacro_oficial_tab()
+    with tab_practica:
+        render_practica_enfocada_tab()
+
+
+# ---------------------------------------------------------------------------
+# Producción UNA — Pestaña 1: Ingesta Admin
+# ---------------------------------------------------------------------------
+def render_ingesta_admin_tab() -> None:
+    st.subheader("📥 Ingesta de Material (Admin)")
+    st.caption(
+        "PDF → aduana de limpieza → OpenRouter (MCQ A–E) → "
+        "`temas_estudio` + `banco_preguntas`."
+    )
+
+    try:
+        materias = banco_repository.fetch_materias()
+    except Exception as exc:
+        st.error(f"No se pudo leer catalogo_materias: {exc}")
+        return
+
+    if not materias:
+        st.warning(
+            "El catálogo está vacío. Ejecuta el seed Tabla 4 Biomédicas "
+            "(`python -m scripts.bootstrap_admision_neon`)."
+        )
+        return
+
+    labels = {
+        int(m["id_materia"]): (
+            f"{int(m['codigo']):02d} · {m['nombre']} "
+            f"({int(m['cantidad_preguntas'])} Q · factor {m['factor_ponderacion']})"
+        )
+        for m in materias
+    }
+    materia_id = st.selectbox(
+        "Materia oficial (catalogo_materias)",
+        options=list(labels.keys()),
+        format_func=lambda mid: labels[mid],
+        key="ingesta_materia_id",
+    )
+
+    uploaded = st.file_uploader(
+        "PDF de academia / apuntes",
+        type=["pdf"],
+        key="ingesta_pdf_uploader",
+    )
+    max_items = st.slider("Ítems máx. por fragmento", 1, 8, 5, key="ingesta_max_items")
+
+    if st.button(
+        "Procesar y Guardar en Bóveda",
+        type="primary",
+        disabled=uploaded is None,
+        width="stretch",
+    ):
+        if uploaded is None:
+            st.error("Sube un PDF primero.")
+            return
+        try:
+            with st.spinner("Aduana PDF (extracción / OCR / limpieza / chunks)..."):
+                doc = process_pdf(uploaded.getvalue(), allow_ocr=True)
+            if not doc.text or not doc.chunks:
+                st.error("PDF sin texto usable. ¿Escaneado sin OCR disponible?")
+                for w in doc.warnings:
+                    st.caption(f"⚠️ {w}")
+                return
+
+            st.info(
+                f"PDF OK · método=`{doc.method}` · {doc.page_count} págs · "
+                f"{len(doc.chunks)} chunks · {doc.chars_per_page:.0f} chars/pág"
+            )
+            for w in doc.warnings:
+                st.caption(f"⚠️ {w}")
+
+            with st.spinner("OpenRouter generando ítems MCQ e insertando en Neon..."):
+                result = extract_banco_preguntas_from_chunks(
+                    doc.chunks,
+                    materia_id=int(materia_id),
+                    max_items_per_chunk=int(max_items),
+                    origen_contenido="pdf",
+                    fuente="openrouter",
+                    persist=True,
+                )
+            st.session_state["ingesta_last_result"] = result.to_dict()
+            pers = result.persistencia or {}
+            st.success(
+                f"Bóveda actualizada · materia **{result.materia_nombre}** · "
+                f"validados={result.items_validados} · "
+                f"insertadas={pers.get('n_insertadas', 0)} · "
+                f"duplicadas={pers.get('n_duplicadas', 0)} · "
+                f"temas={pers.get('temas_upserted', 0)}"
+            )
+            if result.warnings:
+                with st.expander("Avisos de extracción"):
+                    for w in result.warnings:
+                        st.write(f"- {w}")
+        except Exception as exc:
+            st.error(f"Fallo en el pipeline de ingesta: {exc}")
+
+    last = st.session_state.get("ingesta_last_result")
+    if last:
+        with st.expander("Último resultado (detalle)"):
+            st.json(last)
+
+
+# ---------------------------------------------------------------------------
+# Producción UNA — Pestaña 2: Simulacro Oficial
+# ---------------------------------------------------------------------------
+def _render_mcq_navigator(
+    *,
+    preguntas: List[Any],
+    index_key: str,
+    answers_key: str,
+    titulo_progreso: str,
+) -> None:
+    """Render genérico de ítems A–E con navegación."""
+    total = len(preguntas)
+    if total == 0:
+        st.warning("No hay preguntas para mostrar.")
+        return
+
+    idx = int(st.session_state.get(index_key) or 0)
+    idx = max(0, min(idx, total - 1))
+    st.session_state[index_key] = idx
+    answers: Dict[str, str] = dict(st.session_state.get(answers_key) or {})
+
+    st.progress((idx + 1) / total, text=f"{titulo_progreso}: {idx + 1} / {total}")
+    q = preguntas[idx]
+    orden = getattr(q, "orden", idx + 1)
+    materia = getattr(q, "materia_nombre", "")
+    tema = getattr(q, "tema_nombre", "")
+    enunciado = getattr(q, "enunciado", "")
+    alts = getattr(q, "alternativas", {}) or {}
+    if not isinstance(alts, dict):
+        alts = {}
+
+    st.markdown(f"**#{orden}** · {materia} · _{tema}_")
+    st.markdown(f"### {enunciado}")
+
+    opciones = [k for k in ("A", "B", "C", "D", "E") if k in alts]
+    qid = str(getattr(q, "id_pregunta", orden))
+    current = answers.get(qid)
+    default_i = opciones.index(current) if current in opciones else 0
+
+    choice = st.radio(
+        "Tu respuesta",
+        options=opciones,
+        format_func=lambda k: f"{k}) {alts.get(k, '')}",
+        index=default_i if opciones else 0,
+        key=f"mcq_radio_{answers_key}_{qid}_{idx}",
+    )
+    answers[qid] = choice
+    st.session_state[answers_key] = answers
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("← Anterior", disabled=idx <= 0, width="stretch"):
+            st.session_state[index_key] = idx - 1
+            st.rerun()
+    with c2:
+        st.caption(f"Marcadas: {len(answers)} / {total}")
+    with c3:
+        if st.button("Siguiente →", disabled=idx >= total - 1, width="stretch", type="primary"):
+            st.session_state[index_key] = idx + 1
+            st.rerun()
+
+
+def render_simulacro_oficial_tab() -> None:
+    st.subheader("📝 Simulacro Oficial UNA (60 preguntas · 120 min)")
+    st.caption(
+        "Muestreo estratificado por `catalogo_materias` + priorización de debilidades "
+        "desde `historial_intentos`."
+    )
+
+    uid = _effective_usuario_id()
+    st.caption(f"usuario_id efectivo: `{uid}`")
+
+    col_a, col_b = st.columns([2, 1])
+    with col_a:
+        start = st.button("Iniciar Simulacro Oficial", type="primary", width="stretch")
+    with col_b:
+        if st.button("Reiniciar simulacro", width="stretch"):
+            st.session_state["simulacro_activo"] = None
+            st.session_state["simulacro_index"] = 0
+            st.session_state["simulacro_respuestas"] = {}
+            st.rerun()
+
+    if start:
+        try:
+            with st.spinner("TutorEngine generando examen de 60 ítems..."):
+                examen = tutor_engine.generar_simulacro_oficial(
+                    usuario_id=uid,
+                    persistir_sesion=True,
+                )
+            st.session_state["simulacro_activo"] = examen
+            st.session_state["simulacro_index"] = 0
+            st.session_state["simulacro_respuestas"] = {}
+            st.success(
+                f"Simulacro listo · sesión `{examen.id_sesion}` · "
+                f"techo ponderado {examen.puntaje_maximo_ponderado} · "
+                f"seed `{examen.seed_muestreo}`"
+            )
+            st.rerun()
+        except (BancoInsuficienteError, CatalogoInvalidoError) as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            st.error(f"No se pudo generar el simulacro: {exc}")
+
+    examen = st.session_state.get("simulacro_activo")
+    if not examen:
+        st.info("Pulsa **Iniciar Simulacro Oficial** cuando el banco tenga cupo por materia.")
+        return
+
+    with st.expander("Composición por materia (prospecto)"):
+        st.dataframe(examen.composicion_por_materia, width="stretch")
+
+    _render_mcq_navigator(
+        preguntas=list(examen.preguntas),
+        index_key="simulacro_index",
+        answers_key="simulacro_respuestas",
+        titulo_progreso="Simulacro",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Producción UNA — Pestaña 3: Práctica Enfocada
+# ---------------------------------------------------------------------------
+def render_practica_enfocada_tab() -> None:
+    st.subheader("🎯 Práctica Enfocada")
+    st.caption(
+        "Bloque libre (SRS + tasa de error) sin cupos del prospecto. "
+        "Los intentos futuros van a `historial_intentos` con `sesion_id = NULL`."
+    )
+
+    uid = _effective_usuario_id()
+    try:
+        materias = banco_repository.fetch_materias()
+    except Exception as exc:
+        st.error(f"No se pudo leer catalogo_materias: {exc}")
+        return
+
+    if not materias:
+        st.warning("Catálogo vacío. Siembra Tabla 4 Biomédicas primero.")
+        return
+
+    labels = {
+        int(m["id_materia"]): f"{int(m['codigo']):02d} · {m['nombre']}" for m in materias
+    }
+    materia_id = st.selectbox(
+        "Materia",
+        options=list(labels.keys()),
+        format_func=lambda mid: labels[mid],
+        key="practica_materia_id",
+    )
+
+    try:
+        temas = banco_repository.fetch_temas_by_materia(int(materia_id))
+    except Exception:
+        temas = []
+
+    tema_options: Dict[Optional[int], str] = {None: "(Toda la materia)"}
+    for t in temas:
+        tema_options[int(t["id_tema"])] = str(t["nombre"])
+
+    tema_id = st.selectbox(
+        "Tema",
+        options=list(tema_options.keys()),
+        format_func=lambda tid: tema_options[tid],
+        key="practica_tema_id",
+    )
+    limite = st.slider("Cantidad de preguntas", 5, 30, 15, key="practica_limite")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        generar = st.button("Generar Práctica", type="primary", width="stretch")
+    with c2:
+        if st.button("Limpiar práctica", width="stretch"):
+            st.session_state["practica_activa"] = None
+            st.session_state["practica_index"] = 0
+            st.session_state["practica_respuestas"] = {}
+            st.rerun()
+
+    if generar:
+        try:
+            with st.spinner("TutorEngine armando bloque de práctica..."):
+                bloque = tutor_engine.generar_practica_enfocada(
+                    usuario_id=uid,
+                    materia_id=int(materia_id),
+                    tema_id=int(tema_id) if tema_id is not None else None,
+                    limite=int(limite),
+                )
+            st.session_state["practica_activa"] = bloque
+            st.session_state["practica_index"] = 0
+            st.session_state["practica_respuestas"] = {}
+            st.success(
+                f"Práctica lista · {bloque.total_preguntas} ítems · "
+                f"prioridad={bloque.resumen_prioridad}"
+            )
+            st.rerun()
+        except (BancoInsuficienteError, ValueError) as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            st.error(f"No se pudo generar la práctica: {exc}")
+
+    bloque = st.session_state.get("practica_activa")
+    if not bloque:
+        st.info("Elige materia/tema y pulsa **Generar Práctica**.")
+        return
+
+    st.caption(f"Resumen de prioridad: {bloque.resumen_prioridad}")
+    _render_mcq_navigator(
+        preguntas=list(bloque.preguntas),
+        index_key="practica_index",
+        answers_key="practica_respuestas",
+        titulo_progreso="Práctica",
+    )
 
 
 if __name__ == "__main__":
