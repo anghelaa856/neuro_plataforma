@@ -1,9 +1,15 @@
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
+
+try:
+    import extra_streamlit_components as stx
+except ImportError:  # pragma: no cover
+    stx = None  # type: ignore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -28,11 +34,113 @@ from app.services.tutor_socratico_service import (
 from app.frontend.render_student_dashboard_tab import render_student_dashboard_tab
 from app.frontend.render_student_ingestion_tab import render_student_ingestion_tab
 
+# Persistencia de sesión en móvil (cookie del navegador)
+_COOKIE_USER_SESSION = "user_session"
+_COOKIE_TTL_DAYS = 7
+
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     """Compat: aduana de limpieza completa; devuelve texto cosido."""
     doc = process_pdf(file_bytes, allow_ocr=True)
     return doc.text
+
+
+def _get_cookie_manager() -> Any:
+    """
+    Inicializa CookieManager una vez por script-run con key estable.
+    Si falta la librería, devuelve None (login solo con session_state).
+    """
+    if stx is None:
+        return None
+    # key fija: evita recrear el componente iframe en cada rerun
+    return stx.CookieManager(key="neuro_plataforma_cookie_manager")
+
+
+def _read_user_session_cookie(cookie_manager: Any) -> Optional[str]:
+    if cookie_manager is None:
+        return None
+    try:
+        # Warm-up: en el primer frame get_all suele venir vacío hasta hidratar JS
+        all_cookies = cookie_manager.get_all() or {}
+        raw = all_cookies.get(_COOKIE_USER_SESSION)
+        if raw is None:
+            raw = cookie_manager.get(cookie=_COOKIE_USER_SESSION)
+        if raw is None:
+            return None
+        value = str(raw).strip()
+        return value or None
+    except Exception:
+        return None
+
+
+def _write_user_session_cookie(cookie_manager: Any, email: str) -> None:
+    if cookie_manager is None:
+        return
+    email_n = (email or "").strip().lower()
+    if not email_n:
+        return
+    try:
+        expires = datetime.now() + timedelta(days=_COOKIE_TTL_DAYS)
+        cookie_manager.set(
+            _COOKIE_USER_SESSION,
+            email_n,
+            key="neuro_set_user_session",
+            expires_at=expires,
+            path="/",
+            same_site="lax",
+        )
+    except Exception:
+        # No bloquear el login si el browser bloquea cookies
+        pass
+
+
+def _delete_user_session_cookie(cookie_manager: Any) -> None:
+    if cookie_manager is None:
+        return
+    try:
+        cookie_manager.delete(_COOKIE_USER_SESSION, key="neuro_del_user_session")
+    except TypeError:
+        # Firmas antiguas de la lib sin `key`
+        try:
+            cookie_manager.delete(_COOKIE_USER_SESSION)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _try_restore_session_from_cookie(cookie_manager: Any) -> bool:
+    """
+    Si hay cookie user_session y no hay auth_user, reconstruye session_state.
+    Retorna True si quedó autenticado.
+    """
+    if _current_user():
+        return True
+    if st.session_state.get("_auth_cookie_restore_done"):
+        return False
+
+    token = _read_user_session_cookie(cookie_manager)
+    if not token:
+        # Tras el warmup, si no hay cookie, no insistir en cada rerun.
+        if st.session_state.get("_neuro_cookie_warmup"):
+            st.session_state["_auth_cookie_restore_done"] = True
+        return False
+
+    st.session_state["_auth_cookie_restore_done"] = True
+    try:
+        # Preferimos email; también aceptamos id numérico por compatibilidad
+        user: Optional[Dict[str, Any]] = None
+        if token.isdigit():
+            user = user_repository.get_by_id(int(token))
+        if user is None:
+            user = user_repository.get_by_email(token)
+        if not user:
+            _delete_user_session_cookie(cookie_manager)
+            return False
+        _establish_user_session(user, cookie_manager=None)  # no reescribir cookie
+        return True
+    except Exception:
+        return False
 
 
 def init_runtime() -> None:
@@ -101,7 +209,11 @@ def _effective_usuario_id() -> int:
     return 1
 
 
-def _establish_user_session(auth: Dict[str, Any]) -> None:
+def _establish_user_session(
+    auth: Dict[str, Any],
+    *,
+    cookie_manager: Any = None,
+) -> None:
     """Guarda el usuario en session_state y limpia estado de bloque UNA ajeno."""
     uid = int(auth["id_usuario"])
     st.session_state["auth_user"] = {
@@ -116,9 +228,11 @@ def _establish_user_session(auth: Dict[str, Any]) -> None:
     st.session_state["practica_respuestas__comprobadas"] = {}
     st.session_state["practica_respuestas__check_ok"] = {}
     st.session_state["socratic_chats"] = {}
+    if cookie_manager is not None:
+        _write_user_session_cookie(cookie_manager, str(auth.get("email") or ""))
 
 
-def _logout() -> None:
+def _logout(*, cookie_manager: Any = None) -> None:
     st.session_state["auth_user"] = None
     st.session_state["usuario_id"] = None
     st.session_state["simulacro_activo"] = None
@@ -126,19 +240,28 @@ def _logout() -> None:
     st.session_state["practica_respuestas__comprobadas"] = {}
     st.session_state["practica_respuestas__check_ok"] = {}
     st.session_state["socratic_chats"] = {}
+    st.session_state["_auth_cookie_restore_done"] = True
+    _delete_user_session_cookie(cookie_manager)
 
 
-def render_auth_gate() -> bool:
+def render_auth_gate(*, cookie_manager: Any = None) -> bool:
     """
     Pantalla de Login / Registro.
     Retorna True si hay sesión activa; False si debe detener el render.
     """
+    # Cookie → session_state (sobrevive a background en móvil)
+    if _try_restore_session_from_cookie(cookie_manager):
+        return True
+
     user = _current_user()
     if user:
         return True
 
     st.title("🧠 Sistema de Estudio Inteligente")
-    st.caption("Inicia sesión o crea una cuenta para guardar tu progreso.")
+    st.caption(
+        "Inicia sesión o crea una cuenta para guardar tu progreso. "
+        "En el celular, tu sesión se recuerda hasta 7 días."
+    )
 
     tab_login, tab_register = st.tabs(["Iniciar sesión", "Registrarse"])
 
@@ -153,7 +276,7 @@ def render_auth_gate() -> bool:
                 if not auth:
                     st.error("Email o contraseña incorrectos.")
                 else:
-                    _establish_user_session(auth)
+                    _establish_user_session(auth, cookie_manager=cookie_manager)
                     st.success(f"Bienvenido/a, {auth['nombre']}.")
                     st.rerun()
             except Exception as exc:
@@ -176,7 +299,7 @@ def render_auth_gate() -> bool:
                         password=password,
                         nombre=nombre,
                     )
-                    _establish_user_session(created)
+                    _establish_user_session(created, cookie_manager=cookie_manager)
                     st.success("Cuenta creada. Ya estás dentro.")
                     st.rerun()
                 except ValueError as exc:
@@ -187,7 +310,6 @@ def render_auth_gate() -> bool:
     return False
 
 
-
 def build_ui() -> None:
     st.set_page_config(
         page_title="Neuro Plataforma · Admisión UNA",
@@ -195,7 +317,18 @@ def build_ui() -> None:
         layout="wide",
     )
 
-    if not render_auth_gate():
+    # CookieManager lo antes posible (tras page_config)
+    cookie_manager = _get_cookie_manager()
+    if cookie_manager is not None and not st.session_state.get("_neuro_cookie_warmup"):
+        # Primer frame: forzar hidratación JS de cookies y re-ejecutar
+        try:
+            cookie_manager.get_all()
+        except Exception:
+            pass
+        st.session_state["_neuro_cookie_warmup"] = True
+        st.rerun()
+
+    if not render_auth_gate(cookie_manager=cookie_manager):
         return
 
     user = _current_user() or {}
@@ -209,7 +342,7 @@ def build_ui() -> None:
     with top_r:
         st.write("")
         if st.button("Cerrar sesión", use_container_width=True):
-            _logout()
+            _logout(cookie_manager=cookie_manager)
             st.rerun()
 
     tab_guias, tab_practica, tab_simulacro, tab_ingesta, tab_dashboard = st.tabs(

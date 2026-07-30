@@ -110,5 +110,20 @@ class UserRepository:
             row = cur.fetchone()
         return dict(row) if row else None
 
+    def get_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        email_n = self._normalize_email(email)
+        if not email_n:
+            return None
+        query = """
+        SELECT id_usuario, email, nombre, creado_en
+        FROM usuarios
+        WHERE email = %s
+        LIMIT 1;
+        """
+        with self._connection.get_cursor() as cur:
+            cur.execute(query, (email_n,))
+            row = cur.fetchone()
+        return dict(row) if row else None
+
 
 user_repository = UserRepository()
