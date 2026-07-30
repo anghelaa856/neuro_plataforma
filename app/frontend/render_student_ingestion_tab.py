@@ -1,13 +1,15 @@
 """
 Ingesta self-service del estudiante: «Generador de Simulacros con tu Guía».
 
-Soporta PDF y fotos JPG/PNG (una o varias). En móvil, los bytes se copian de
-inmediato a session_state (lista) para no perderlos en el rerun de cámara/galería.
+Límite duro: máximo 3 archivos por lote (Space gratuito / anti-OOM).
+Carga perezosa: se hace .read()/.getvalue() de UNA imagen a la vez → comprimir
+→ analizar → liberar RAM → siguiente.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence
+import gc
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import streamlit as st
 from pypdf import PdfReader
@@ -27,14 +29,18 @@ PAGINAS_LARGAS = 20
 MAX_PAGINAS_DEFAULT = 30
 MAX_PAGINAS_HARD = 80
 
+# Anti-OOM en Hugging Face Spaces (CPU básico)
+MAX_FILES_PER_BATCH = 3
+
 _IMAGE_EXTS = {"png", "jpg", "jpeg"}
 _PDF_EXTS = {"pdf"}
 
-# Persistencia anti-pérdida en Android/Chrome (lote de archivos)
-_SS_FILES = "student_ingesta_uploaded_files"  # List[{id, name, bytes}]
+# Metadatos / cola perezosa (NO guardar N originales full-res de golpe)
+_SS_QUEUE = "student_ingesta_upload_queue"  # List[{id, name, kind}]
+_SS_COMPRESSED = "student_ingesta_compressed_cache"  # id → bytes ya comprimidos
 _SS_UPLOADER_NONCE = "student_ingesta_uploader_nonce"
-# Claves legacy (archivo único) — se limpian al migrar/limpiar
 _LEGACY_KEYS = (
+    "student_ingesta_uploaded_files",
     "student_ingesta_uploaded_file_bytes",
     "student_ingesta_uploaded_file_name",
     "student_ingesta_uploaded_file_id",
@@ -57,31 +63,27 @@ def _file_ext(name: Optional[str]) -> str:
 def _ensure_ingesta_session_defaults() -> None:
     if _SS_UPLOADER_NONCE not in st.session_state:
         st.session_state[_SS_UPLOADER_NONCE] = 0
-    if _SS_FILES not in st.session_state:
-        st.session_state[_SS_FILES] = []
-    # Migración suave: un archivo suelto de la versión anterior → lista
-    legacy_bytes = st.session_state.get("student_ingesta_uploaded_file_bytes")
-    legacy_name = st.session_state.get("student_ingesta_uploaded_file_name")
-    if legacy_bytes and not st.session_state[_SS_FILES]:
-        name = str(legacy_name or "archivo")
-        raw = bytes(legacy_bytes)
-        fid = str(st.session_state.get("student_ingesta_uploaded_file_id") or f"{name}:{len(raw)}")
-        st.session_state[_SS_FILES] = [{"id": fid, "name": name, "bytes": raw}]
-        for key in _LEGACY_KEYS:
-            st.session_state.pop(key, None)
+    if _SS_QUEUE not in st.session_state:
+        st.session_state[_SS_QUEUE] = []
+    if _SS_COMPRESSED not in st.session_state:
+        st.session_state[_SS_COMPRESSED] = {}
+    # Limpiar legado que acumulaba bytes full-res
+    for key in _LEGACY_KEYS:
+        st.session_state.pop(key, None)
 
 
 def _clear_persisted_uploads() -> None:
-    st.session_state[_SS_FILES] = []
+    st.session_state[_SS_QUEUE] = []
+    st.session_state[_SS_COMPRESSED] = {}
     for key in _LEGACY_KEYS:
         st.session_state.pop(key, None)
     st.session_state[_SS_UPLOADER_NONCE] = int(
         st.session_state.get(_SS_UPLOADER_NONCE) or 0
     ) + 1
+    gc.collect()
 
 
 def _normalize_uploader_value(uploaded: Any) -> List[Any]:
-    """Streamlit: un archivo → UploadedFile; varios → list."""
     if uploaded is None:
         return []
     if isinstance(uploaded, list):
@@ -89,81 +91,68 @@ def _normalize_uploader_value(uploaded: Any) -> List[Any]:
     return [uploaded]
 
 
-def _persist_uploaded_files(uploaded_list: Sequence[Any]) -> None:
-    """
-    Copia inmediata del lote del widget → session_state (merge por id).
-    Las fotos se comprimen YA (≤1024px, JPEG q70) para no guardar originales
-    de alta resolución en RAM del Space.
-    """
-    if not uploaded_list:
-        return
+def _read_uploaded_bytes_once(uploaded: Any) -> bytes:
+    """Lee el búfer del UploadedFile una sola vez (lazy)."""
+    if hasattr(uploaded, "read"):
+        try:
+            uploaded.seek(0)
+        except Exception:
+            pass
+        data = uploaded.read()
+        if data:
+            return bytes(data)
+    return bytes(uploaded.getvalue())
 
-    by_id: Dict[str, Dict[str, Any]] = {
-        str(item["id"]): dict(item)
-        for item in (st.session_state.get(_SS_FILES) or [])
-        if isinstance(item, dict) and item.get("id") and item.get("bytes")
-    }
 
+def _register_queue_metadata(uploaded_list: Sequence[Any]) -> None:
+    """Solo nombres/ids en sesión — sin .read() aún."""
+    queue: List[Dict[str, str]] = []
     for uploaded in uploaded_list:
         name = str(getattr(uploaded, "name", None) or "archivo")
-        raw = bytes(uploaded.getvalue())
+        size = getattr(uploaded, "size", None)
+        file_id = f"{name}:{size if size is not None else 'pending'}"
         ext = _file_ext(name)
         if ext in _IMAGE_EXTS:
-            try:
-                raw = compress_image_bytes(raw, max_side=1024, jpeg_quality=70)
-                # Normalizar extensión lógica (siempre JPEG tras compress)
-                if not name.lower().endswith((".jpg", ".jpeg")):
-                    base = name.rsplit(".", 1)[0] if "." in name else name
-                    name = f"{base}.jpg"
-            except Exception:
-                # Si Pillow falla, no bloqueamos el lote; la IA intentará después.
-                pass
-        size = len(raw)
-        file_id = f"{name}:{size}"
-        by_id[file_id] = {"id": file_id, "name": name, "bytes": raw}
-        del raw
-
-    st.session_state[_SS_FILES] = list(by_id.values())
-    import gc
-
-    gc.collect()
-
-
-def _persisted_files() -> List[Dict[str, Any]]:
-    items = st.session_state.get(_SS_FILES) or []
-    out: List[Dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        data = item.get("bytes")
-        name = item.get("name")
-        if not data or not isinstance(data, (bytes, bytearray)):
-            continue
-        out.append(
-            {
-                "id": str(item.get("id") or f"{name}:{len(data)}"),
-                "name": str(name or "archivo"),
-                "bytes": bytes(data),
-            }
-        )
-    return out
-
-
-def _partition_files(
-    files: Sequence[Dict[str, Any]],
-) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    images: List[Dict[str, Any]] = []
-    pdfs: List[Dict[str, Any]] = []
-    other: List[Dict[str, Any]] = []
-    for f in files:
-        ext = _file_ext(str(f.get("name") or ""))
-        if ext in _IMAGE_EXTS:
-            images.append(f)
+            kind = "image"
         elif ext in _PDF_EXTS:
-            pdfs.append(f)
+            kind = "pdf"
         else:
-            other.append(f)
-    return images, pdfs, other
+            kind = "other"
+        queue.append({"id": file_id, "name": name, "kind": kind})
+    st.session_state[_SS_QUEUE] = queue
+
+
+def _queue_items() -> List[Dict[str, str]]:
+    items = st.session_state.get(_SS_QUEUE) or []
+    return [dict(x) for x in items if isinstance(x, dict) and x.get("name")]
+
+
+def _lazy_load_and_compress_one(
+    uploaded: Any,
+    *,
+    name: str,
+    kind: str,
+) -> Tuple[str, bytes]:
+    """
+    .read() de UN archivo → comprimir si es imagen → devolver bytes livianos.
+    No deja el original en variables al salir.
+    """
+    raw = _read_uploaded_bytes_once(uploaded)
+    out_name = name
+    try:
+        if kind == "image":
+            compressed = compress_image_bytes(raw, max_side=1024, jpeg_quality=70)
+            del raw
+            raw = None  # type: ignore
+            gc.collect()
+            if not out_name.lower().endswith((".jpg", ".jpeg")):
+                base = out_name.rsplit(".", 1)[0] if "." in out_name else out_name
+                out_name = f"{base}.jpg"
+            return out_name, compressed
+        return out_name, raw
+    except Exception:
+        # Si falla compress, devolver original (último recurso)
+        return out_name, raw if isinstance(raw, (bytes, bytearray)) else b""
 
 
 def _mostrar_resultado_agregado(
@@ -211,9 +200,8 @@ def _mostrar_resultado_agregado(
 def render_student_ingestion_tab(*, usuario_id: int) -> None:
     st.subheader("📚 Generador de Simulacros con tu Guía")
     st.caption(
-        "**1.** Sube uno o varios archivos: **PDF** y/o **fotos** (JPG/PNG) del compendio.  "
-        "**2.** La IA extrae preguntas A–E privadas, las clasifica en la materia "
-        "oficial correcta y omite temas que ya tienes."
+        "**1.** Sube **máximo 3 fotos** (o PDFs) del compendio por lote.  "
+        "**2.** La IA extrae preguntas A–E, las clasifica por materia y omite temas ya cubiertos."
     )
 
     _ensure_ingesta_session_defaults()
@@ -231,43 +219,80 @@ def render_student_ingestion_tab(*, usuario_id: int) -> None:
     with st.expander("¿Qué materias reconoce la IA?", expanded=False):
         st.write(", ".join(f"{int(m['codigo']):02d}. {m['nombre']}" for m in materias))
 
+    st.info(
+        f"Límite del servidor gratuito: **máximo {MAX_FILES_PER_BATCH} archivos** "
+        "por carga (≤ 30 MB en total). Sube de a 3 fotos y vuelve a cargar si necesitas más."
+    )
+
     uploader_key = f"student_ingesta_upload_{int(st.session_state[_SS_UPLOADER_NONCE])}"
     uploaded = st.file_uploader(
-        "PDF(s) o foto(s) de tu guía / compendio",
+        "PDF(s) o foto(s) — máximo 3 a la vez",
         type=["pdf", "png", "jpg", "jpeg"],
         accept_multiple_files=True,
         key=uploader_key,
         help=(
-            "Puedes seleccionar varias fotos a la vez (p. ej. 3 páginas del compendio). "
-            "En el celular se guardan en la sesión apenas las eliges."
+            "Sube máximo 3 fotos a la vez. "
+            "Cada imagen se lee y comprime de a una para no saturar la memoria."
         ),
     )
 
     uploaded_list = _normalize_uploader_value(uploaded)
-    if uploaded_list:
-        try:
-            _persist_uploaded_files(uploaded_list)
-        except Exception as exc:
-            st.error(f"No se pudo guardar el lote en sesión: {exc}")
 
-    files = _persisted_files()
-    has_files = len(files) > 0
-    images, pdfs, other = _partition_files(files)
+    # Validación dura ANTES de cualquier .read() / getvalue()
+    if len(uploaded_list) > MAX_FILES_PER_BATCH:
+        st.error(
+            "⚠️ Límite de servidor gratuito: Por favor, sube un máximo de 3 fotos "
+            "a la vez para evitar sobrecargar la memoria."
+        )
+        st.stop()
+
+    if uploaded_list:
+        _register_queue_metadata(uploaded_list)
+
+    queue = _queue_items()
+    # Preferir widget vivo; si móvil lo vació, usar cola de nombres (sin bytes)
+    live_files = uploaded_list
+    has_selection = bool(live_files) or bool(queue)
+    n_selected = len(live_files) if live_files else len(queue)
 
     max_pages: Optional[int] = None
 
-    if has_files:
-        total_bytes = sum(len(f["bytes"]) for f in files)
+    def _kind_of_name(name: str) -> str:
+        ext = _file_ext(name)
+        if ext in _IMAGE_EXTS:
+            return "image"
+        if ext in _PDF_EXTS:
+            return "pdf"
+        return "other"
+
+    display_items: List[Dict[str, str]] = []
+    if live_files:
+        for uf in live_files:
+            nm = str(getattr(uf, "name", None) or "archivo")
+            display_items.append({"name": nm, "kind": _kind_of_name(nm)})
+    else:
+        display_items = [
+            {
+                "name": str(q.get("name") or "archivo"),
+                "kind": str(q.get("kind") or "other"),
+            }
+            for q in queue
+        ]
+
+    n_images = sum(1 for d in display_items if d["kind"] == "image")
+    n_pdfs = sum(1 for d in display_items if d["kind"] == "pdf")
+    n_other = sum(1 for d in display_items if d["kind"] == "other")
+
+    if has_selection:
         st.success(
-            f"**{len(files)} archivo(s) listos en sesión** "
-            f"({total_bytes:,} bytes · "
-            f"{len(images)} foto(s), {len(pdfs)} PDF(s)"
-            + (f", {len(other)} otro(s)" if other else "")
-            + ")."
+            f"**{n_selected} archivo(s) listos en sesión** · "
+            f"{n_images} foto(s), {n_pdfs} PDF(s)"
+            + (f", {n_other} otro(s)" if n_other else "")
+            + ". Aún no se leyeron a memoria: el análisis carga de a una."
         )
-        with st.expander("Ver archivos en sesión", expanded=len(files) <= 5):
-            for f in files:
-                st.caption(f"• `{f['name']}` ({len(f['bytes']):,} bytes)")
+        with st.expander("Ver archivos seleccionados", expanded=True):
+            for d in display_items:
+                st.caption(f"• `{d['name']}` ({d['kind']})")
 
         clear_col, _ = st.columns([1, 2])
         with clear_col:
@@ -279,60 +304,54 @@ def render_student_ingestion_tab(*, usuario_id: int) -> None:
                 _clear_persisted_uploads()
                 st.rerun()
 
-    if pdfs:
-        longest = max((_count_pdf_pages(p["bytes"]) for p in pdfs), default=0)
-        if longest > PAGINAS_LARGAS:
-            st.warning(
-                f"Al menos un PDF tiene **{longest} páginas**. "
-                "El límite aplica a cada PDF del lote."
-            )
-            max_pages = st.slider(
-                "Procesar primeras N páginas (por PDF)",
-                min_value=5,
-                max_value=min(MAX_PAGINAS_HARD, max(longest, 5)),
-                value=min(MAX_PAGINAS_DEFAULT, longest),
-                key="student_ingesta_max_pages",
-            )
-        elif longest > 0:
-            st.caption(f"PDF(s): hasta **{longest}** páginas · se analizarán completos.")
-
-    if images:
+    if n_pdfs:
         st.caption(
-            "Modo foto (lote): cada imagen se comprime (máx. 1024px, JPEG) y "
-            "se analiza de a una para no saturar la memoria del servidor."
+            "Si algún PDF es muy largo, tras iniciar el análisis podrás limitar páginas "
+            "(se aplica al leer cada PDF de a uno)."
         )
-        preview_n = min(6, len(images))
-        cols = st.columns(min(3, preview_n))
-        for i in range(preview_n):
-            with cols[i % len(cols)]:
-                try:
-                    st.image(images[i]["bytes"], caption=images[i]["name"], width=180)
-                except Exception:
-                    st.caption(images[i]["name"])
-        if len(images) > preview_n:
-            st.caption(f"… y {len(images) - preview_n} foto(s) más.")
+        max_pages = st.slider(
+            "Procesar primeras N páginas (por PDF)",
+            min_value=5,
+            max_value=MAX_PAGINAS_HARD,
+            value=MAX_PAGINAS_DEFAULT,
+            key="student_ingesta_max_pages",
+        )
 
-    if other:
+    if n_images:
+        st.caption(
+            "Sube máximo 3 fotos a la vez. Cada una se comprime (≤1024px) y se analiza "
+            "sola antes de pasar a la siguiente."
+        )
+
+    if n_other:
+        st.warning("Hay archivos con formato no soportado. Usa PDF, PNG, JPG o JPEG.")
+
+    can_run = has_selection and (n_images + n_pdfs) > 0 and bool(live_files)
+    if has_selection and not live_files:
         st.warning(
-            "Hay archivos con formato no soportado: "
-            + ", ".join(f"`{o['name']}`" for o in other)
-            + ". Usa PDF, PNG, JPG o JPEG, o limpia el lote."
+            "La selección del celular se perdió en el rerun y no hay bytes en memoria "
+            "(modo anti-OOM). Volvé a elegir las mismas fotos (máx. 3) y pulsá "
+            "**Analizar** enseguida."
         )
 
     if st.button(
         "Analizar mi guía con IA",
         type="primary",
-        disabled=not has_files or (not images and not pdfs),
+        disabled=not can_run,
         use_container_width=True,
         key="student_ingesta_run",
     ):
-        files = _persisted_files()
-        images, pdfs, other = _partition_files(files)
-        if not images and not pdfs:
-            st.error("Sube al menos un PDF o una foto válida primero.")
+        if not live_files:
+            st.error("No hay archivos vivos en el uploader. Subí de nuevo (máx. 3).")
+            return
+        if len(live_files) > MAX_FILES_PER_BATCH:
+            st.error(
+                "⚠️ Límite de servidor gratuito: Por favor, sube un máximo de 3 fotos "
+                "a la vez para evitar sobrecargar la memoria."
+            )
             return
 
-        progress = st.progress(0, text="Preparando tu lote…")
+        progress = st.progress(0, text="Preparando lote perezoso…")
         status = st.empty()
         results: List[BancoIngestionResult] = []
         warnings: List[str] = []
@@ -341,7 +360,7 @@ def render_student_ingestion_tab(*, usuario_id: int) -> None:
         n_temas = 0
         chunks_procesados = 0
         materias_tocadas: Dict[str, Any] = {}
-        n_archivos = len(images) + len(pdfs)
+        n_archivos = 0
 
         def _absorb(result: BancoIngestionResult) -> None:
             nonlocal n_insertadas, n_duplicadas, n_temas, chunks_procesados
@@ -355,108 +374,95 @@ def render_student_ingestion_tab(*, usuario_id: int) -> None:
                 materias_tocadas[k] = int(materias_tocadas.get(k) or 0) + int(v or 0)
             warnings.extend(list(result.warnings or []))
 
+        total = len(live_files)
         try:
-            steps_done = 0
-            total_steps = (1 if images else 0) + len(pdfs)
-
-            # 1) Todas las fotos → pipeline secuencial (Base64 + OpenRouter por imagen)
-            if images:
-                status.info(
-                    f"Analizando {len(images)} foto(s) con IA multimodal (secuencial)…"
-                )
+            for idx, uploaded_file in enumerate(live_files):
+                name = str(getattr(uploaded_file, "name", None) or f"archivo_{idx + 1}")
+                kind = _kind_of_name(name)
+                status.info(f"Leyendo archivo {idx + 1}/{total}: `{name}`…")
                 progress.progress(
-                    min(0.95, 0.05 + 0.9 * (steps_done / max(total_steps, 1))),
-                    text=f"Fotos 0/{len(images)}…",
+                    min(0.95, (idx) / max(total, 1)),
+                    text=f"{idx + 1}/{total} · cargando…",
                 )
 
-                def _on_img(idx: int, total: int, msg: str) -> None:
-                    local = (idx + 1) / max(total, 1) if total else 1.0
-                    if idx >= total:
-                        local = 1.0
-                    overall = (steps_done + local) / max(total_steps, 1)
-                    progress.progress(min(0.95, 0.05 + 0.9 * overall), text=msg)
-                    status.write(msg)
-
-                lote_nombre = (
-                    images[0]["name"]
-                    if len(images) == 1
-                    else f"lote_{len(images)}_fotos"
-                )
-                st.info(
-                    f"Lote de fotos · {len(images)} imagen(es) · "
-                    "cada una se convierte a Base64 y se envía a OpenRouter."
-                )
-                img_result = extract_banco_preguntas_from_images(
-                    [{"bytes": img["bytes"], "nombre": img["name"]} for img in images],
-                    materia_id=None,
-                    auto_clasificar=True,
-                    origen_contenido="imagen",
-                    fuente="openrouter",
-                    nombre_archivo_fuente=str(lote_nombre),
-                    propietario_usuario_id=uid,
-                    persist=True,
-                    pause_between_images_s=0.4,
-                    on_image_progress=_on_img,
-                )
-                _absorb(img_result)
-                steps_done += 1
-
-            # 2) Cada PDF → chunks de texto (misma lógica de siempre)
-            for pdf_i, pdf in enumerate(pdfs):
-                status.info(
-                    f"Extrayendo PDF {pdf_i + 1}/{len(pdfs)}: `{pdf['name']}`…"
-                )
-                progress.progress(
-                    min(0.95, 0.05 + 0.9 * (steps_done / max(total_steps, 1))),
-                    text=f"PDF {pdf_i + 1}/{len(pdfs)}…",
-                )
-                doc = process_pdf(
-                    pdf["bytes"],
-                    allow_ocr=True,
-                    source_filename=pdf["name"],
-                    max_pages=max_pages,
-                )
-                if not doc.text or not doc.chunks:
-                    warnings.append(
-                        f"PDF «{pdf['name']}»: sin texto útil (¿escaneado sin OCR?)."
-                    )
-                    for w in doc.warnings:
-                        warnings.append(f"PDF «{pdf['name']}»: {w}")
-                    steps_done += 1
+                if kind == "other":
+                    warnings.append(f"Omitido formato no soportado: {name}")
                     continue
 
-                nombre_pdf = (
-                    (doc.meta or {}).get("nombre_archivo_fuente") or pdf["name"]
+                # --- Lazy: read → compress → process → free ---
+                out_name, payload = _lazy_load_and_compress_one(
+                    uploaded_file, name=name, kind=kind
                 )
-                pages_proc = (doc.meta or {}).get("pages_procesadas") or doc.page_count
-                st.info(
-                    f"PDF listo · `{nombre_pdf}` · "
-                    f"{pages_proc}/{doc.page_count} págs · "
-                    f"**{len(doc.chunks)} fragmentos** · método `{doc.method}`"
-                )
+                n_archivos += 1
 
-                def _on_chunk(idx: int, total: int, msg: str, _sd=steps_done) -> None:
-                    local = (idx + 1) / max(total, 1) if total else 1.0
-                    if idx >= total:
-                        local = 1.0
-                    overall = (_sd + local) / max(total_steps, 1)
-                    progress.progress(min(0.95, 0.05 + 0.9 * overall), text=msg)
-                    status.write(msg)
+                if kind == "image":
+                    status.write(
+                        f"Analizando foto {idx + 1}/{total} con IA (comprimida)…"
+                    )
 
-                pdf_result = extract_banco_preguntas_from_chunks(
-                    doc.chunks,
-                    materia_id=None,
-                    auto_clasificar=True,
-                    origen_contenido="pdf",
-                    fuente="openrouter",
-                    nombre_archivo_fuente=str(nombre_pdf),
-                    propietario_usuario_id=uid,
-                    persist=True,
-                    pause_between_chunks_s=0.4,
-                    on_chunk_progress=_on_chunk,
+                    def _on_img(i: int, t: int, msg: str) -> None:
+                        status.write(msg)
+
+                    img_result = extract_banco_preguntas_from_images(
+                        [{"bytes": payload, "nombre": out_name}],
+                        materia_id=None,
+                        auto_clasificar=True,
+                        origen_contenido="imagen",
+                        fuente="openrouter",
+                        nombre_archivo_fuente=str(out_name),
+                        propietario_usuario_id=uid,
+                        persist=True,
+                        pause_between_images_s=0.0,
+                        on_image_progress=_on_img,
+                    )
+                    _absorb(img_result)
+                else:
+                    status.write(f"Extrayendo PDF {idx + 1}/{total}: `{out_name}`…")
+                    doc = process_pdf(
+                        payload,
+                        allow_ocr=True,
+                        source_filename=out_name,
+                        max_pages=max_pages,
+                    )
+                    if not doc.text or not doc.chunks:
+                        warnings.append(
+                            f"PDF «{out_name}»: sin texto útil (¿escaneado sin OCR?)."
+                        )
+                        for w in doc.warnings:
+                            warnings.append(f"PDF «{out_name}»: {w}")
+                    else:
+                        nombre_pdf = (
+                            (doc.meta or {}).get("nombre_archivo_fuente") or out_name
+                        )
+                        st.info(
+                            f"PDF listo · `{nombre_pdf}` · "
+                            f"**{len(doc.chunks)} fragmentos** · método `{doc.method}`"
+                        )
+
+                        def _on_chunk(i: int, t: int, msg: str) -> None:
+                            status.write(msg)
+
+                        pdf_result = extract_banco_preguntas_from_chunks(
+                            doc.chunks,
+                            materia_id=None,
+                            auto_clasificar=True,
+                            origen_contenido="pdf",
+                            fuente="openrouter",
+                            nombre_archivo_fuente=str(nombre_pdf),
+                            propietario_usuario_id=uid,
+                            persist=True,
+                            pause_between_chunks_s=0.35,
+                            on_chunk_progress=_on_chunk,
+                        )
+                        _absorb(pdf_result)
+                    del doc
+
+                del payload
+                gc.collect()
+                progress.progress(
+                    min(0.95, (idx + 1) / max(total, 1)),
+                    text=f"{idx + 1}/{total} · listo",
                 )
-                _absorb(pdf_result)
-                steps_done += 1
 
             if not results and warnings:
                 progress.empty()
@@ -479,8 +485,11 @@ def render_student_ingestion_tab(*, usuario_id: int) -> None:
                 warnings=warnings,
                 raw_results=results,
             )
+            # Liberar cola tras éxito
+            _clear_persisted_uploads()
         except Exception as exc:
             st.error(f"No se pudo procesar tu guía: {exc}")
+            gc.collect()
 
     last: Optional[Dict[str, Any]] = st.session_state.get("student_ingesta_last")
     if last:
