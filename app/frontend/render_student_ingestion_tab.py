@@ -26,8 +26,10 @@ from app.services.pdf_processor import process_pdf
 
 # Umbral a partir del cual pedimos acotar páginas
 PAGINAS_LARGAS = 20
-MAX_PAGINAS_DEFAULT = 30
-MAX_PAGINAS_HARD = 80
+DEFAULT_PAGE_START = 1
+DEFAULT_PAGE_END = 10
+MAX_PAGINA_INPUT = 5000
+MAX_RANGE_WARN = 80  # aviso suave anti-OOM (no bloquea)
 
 # Anti-OOM en Hugging Face Spaces (CPU básico)
 MAX_FILES_PER_BATCH = 3
@@ -255,7 +257,9 @@ def render_student_ingestion_tab(*, usuario_id: int) -> None:
     has_selection = bool(live_files) or bool(queue)
     n_selected = len(live_files) if live_files else len(queue)
 
-    max_pages: Optional[int] = None
+    page_start: int = DEFAULT_PAGE_START
+    page_end: int = DEFAULT_PAGE_END
+    range_ok = True
 
     def _kind_of_name(name: str) -> str:
         ext = _file_ext(name)
@@ -306,16 +310,46 @@ def render_student_ingestion_tab(*, usuario_id: int) -> None:
 
     if n_pdfs:
         st.caption(
-            "Si algún PDF es muy largo, tras iniciar el análisis podrás limitar páginas "
-            "(se aplica al leer cada PDF de a uno)."
+            "Para PDFs largos, elegí el **rango de páginas** del capítulo "
+            "(ej. 115–130). Se aplica a cada PDF del lote."
         )
-        max_pages = st.slider(
-            "Procesar primeras N páginas (por PDF)",
-            min_value=5,
-            max_value=MAX_PAGINAS_HARD,
-            value=MAX_PAGINAS_DEFAULT,
-            key="student_ingesta_max_pages",
-        )
+        c_ini, c_fin = st.columns(2)
+        with c_ini:
+            page_start = int(
+                st.number_input(
+                    "Página de inicio",
+                    min_value=1,
+                    max_value=MAX_PAGINA_INPUT,
+                    value=DEFAULT_PAGE_START,
+                    step=1,
+                    key="student_ingesta_page_start",
+                )
+            )
+        with c_fin:
+            page_end = int(
+                st.number_input(
+                    "Página final",
+                    min_value=1,
+                    max_value=MAX_PAGINA_INPUT,
+                    value=DEFAULT_PAGE_END,
+                    step=1,
+                    key="student_ingesta_page_end",
+                )
+            )
+        if page_end < page_start:
+            range_ok = False
+            st.error(
+                "La página final no puede ser menor que la de inicio. "
+                f"Ajustá el rango (ahora: {page_start} → {page_end})."
+            )
+        else:
+            n_range = page_end - page_start + 1
+            st.caption(f"Se leerán las páginas **{page_start}–{page_end}** ({n_range} pág.).")
+            if n_range > MAX_RANGE_WARN:
+                st.warning(
+                    f"El rango tiene {n_range} páginas (>{MAX_RANGE_WARN}). "
+                    "En el plan gratuito conviene trocear el capítulo para evitar OOM."
+                )
 
     if n_images:
         st.caption(
@@ -326,7 +360,12 @@ def render_student_ingestion_tab(*, usuario_id: int) -> None:
     if n_other:
         st.warning("Hay archivos con formato no soportado. Usa PDF, PNG, JPG o JPEG.")
 
-    can_run = has_selection and (n_images + n_pdfs) > 0 and bool(live_files)
+    can_run = (
+        has_selection
+        and (n_images + n_pdfs) > 0
+        and bool(live_files)
+        and range_ok
+    )
     if has_selection and not live_files:
         st.warning(
             "La selección del celular se perdió en el rerun y no hay bytes en memoria "
@@ -422,7 +461,8 @@ def render_student_ingestion_tab(*, usuario_id: int) -> None:
                         payload,
                         allow_ocr=True,
                         source_filename=out_name,
-                        max_pages=max_pages,
+                        page_start=int(page_start),
+                        page_end=int(page_end),
                     )
                     if not doc.text or not doc.chunks:
                         warnings.append(
@@ -434,8 +474,15 @@ def render_student_ingestion_tab(*, usuario_id: int) -> None:
                         nombre_pdf = (
                             (doc.meta or {}).get("nombre_archivo_fuente") or out_name
                         )
+                        p0 = (doc.meta or {}).get("page_start")
+                        p1 = (doc.meta or {}).get("page_end")
+                        rango = (
+                            f"págs {p0}–{p1}"
+                            if p0 and p1
+                            else f"{doc.meta.get('pages_procesadas', '?')} págs"
+                        )
                         st.info(
-                            f"PDF listo · `{nombre_pdf}` · "
+                            f"PDF listo · `{nombre_pdf}` · {rango} · "
                             f"**{len(doc.chunks)} fragmentos** · método `{doc.method}`"
                         )
 

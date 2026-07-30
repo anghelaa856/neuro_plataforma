@@ -57,8 +57,50 @@ def _count_pages_pypdf(file_bytes: bytes) -> int:
     return len(reader.pages)
 
 
+def _resolve_page_bounds(
+    total_pages: int,
+    *,
+    page_start: Optional[int] = None,
+    page_end: Optional[int] = None,
+    max_pages: Optional[int] = None,
+) -> Tuple[int, int, int]:
+    """
+    Resuelve un rango 1-indexado inclusivo → índices 0-based [start, end_excl).
+
+    Prioridad:
+      1) ``page_start`` / ``page_end`` si alguno viene definido
+      2) ``max_pages`` legacy → páginas 1..N
+      3) todo el documento
+
+    Returns:
+        (start_0, end_excl, total_pages)
+    """
+    total = max(0, int(total_pages))
+    if total <= 0:
+        return 0, 0, 0
+
+    if page_start is not None or page_end is not None:
+        start_1 = 1 if page_start is None else int(page_start)
+        end_1 = total if page_end is None else int(page_end)
+        start_1 = max(1, min(start_1, total))
+        end_1 = max(1, min(end_1, total))
+        if end_1 < start_1:
+            start_1, end_1 = end_1, start_1
+        return start_1 - 1, end_1, total
+
+    if max_pages is not None:
+        n = max(1, min(int(max_pages), total))
+        return 0, n, total
+
+    return 0, total, total
+
+
 def extract_native_pypdf(
-    file_bytes: bytes, *, max_pages: Optional[int] = None
+    file_bytes: bytes,
+    *,
+    max_pages: Optional[int] = None,
+    page_start: Optional[int] = None,
+    page_end: Optional[int] = None,
 ) -> Tuple[str, int]:
     """Extracción de texto embebido con pypdf (siempre disponible en el stack)."""
     from pypdf import PdfReader
@@ -66,16 +108,22 @@ def extract_native_pypdf(
     reader = PdfReader(BytesIO(file_bytes))
     pages = list(reader.pages)
     total = len(pages)
-    if max_pages is not None:
-        pages = pages[: max(1, int(max_pages))]
+    start_0, end_excl, _ = _resolve_page_bounds(
+        total, page_start=page_start, page_end=page_end, max_pages=max_pages
+    )
+    selected = pages[start_0:end_excl]
     parts: List[str] = []
-    for page in pages:
+    for page in selected:
         parts.append(page.extract_text() or "")
     return "\n\n".join(parts), total
 
 
 def extract_native_pymupdf(
-    file_bytes: bytes, *, max_pages: Optional[int] = None
+    file_bytes: bytes,
+    *,
+    max_pages: Optional[int] = None,
+    page_start: Optional[int] = None,
+    page_end: Optional[int] = None,
 ) -> Tuple[str, int]:
     """
     Extracción nativa con PyMuPDF (mejor en PDFs 'sucios' con layout raro).
@@ -86,8 +134,12 @@ def extract_native_pymupdf(
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     try:
         total = doc.page_count
-        limit = total if max_pages is None else min(total, max(1, int(max_pages)))
-        parts = [doc.load_page(i).get_text("text") or "" for i in range(limit)]
+        start_0, end_excl, _ = _resolve_page_bounds(
+            total, page_start=page_start, page_end=page_end, max_pages=max_pages
+        )
+        parts = [
+            doc.load_page(i).get_text("text") or "" for i in range(start_0, end_excl)
+        ]
         return "\n\n".join(parts), total
     finally:
         doc.close()
@@ -123,6 +175,8 @@ def extract_ocr_tesseract(
     lang: str = "spa+eng",
     dpi: int = 200,
     max_pages: Optional[int] = None,
+    page_start: Optional[int] = None,
+    page_end: Optional[int] = None,
 ) -> Tuple[str, int]:
     """
     Fallback OCR: rasteriza páginas (pdf2image/poppler) + pytesseract.
@@ -134,9 +188,29 @@ def extract_ocr_tesseract(
     from pdf2image import convert_from_bytes  # type: ignore
     import pytesseract  # type: ignore
 
-    images = convert_from_bytes(file_bytes, dpi=dpi)
-    if max_pages is not None:
-        images = images[: max(1, int(max_pages))]
+    # Contar páginas sin rasterizar todo el PDF
+    try:
+        from pypdf import PdfReader
+
+        total = len(PdfReader(BytesIO(file_bytes)).pages)
+    except Exception:
+        total = 0
+
+    start_0, end_excl, total_r = _resolve_page_bounds(
+        total if total > 0 else 10_000,
+        page_start=page_start,
+        page_end=page_end,
+        max_pages=max_pages,
+    )
+    first_page = start_0 + 1
+    last_page = end_excl
+
+    convert_kwargs: Dict[str, Any] = {"dpi": dpi}
+    if total > 0 or page_start is not None or page_end is not None or max_pages is not None:
+        convert_kwargs["first_page"] = first_page
+        convert_kwargs["last_page"] = last_page
+
+    images = convert_from_bytes(file_bytes, **convert_kwargs)
 
     parts: List[str] = []
     for idx, image in enumerate(images, start=1):
@@ -147,8 +221,15 @@ def extract_ocr_tesseract(
             page_text = pytesseract.image_to_string(image, lang="eng") or ""
         parts.append(page_text)
         logger.debug("OCR página %s/%s → %s chars", idx, len(images), len(page_text))
+        # Liberar raster página a página
+        try:
+            image.close()
+        except Exception:
+            pass
 
-    return "\n\n".join(parts), len(images)
+    del images
+    n_out = len(parts)
+    return "\n\n".join(parts), (total_r if total > 0 else n_out)
 
 
 def extract_pdf_text_hybrid(
@@ -159,29 +240,46 @@ def extract_pdf_text_hybrid(
     ocr_lang: str = "spa+eng",
     ocr_max_pages: Optional[int] = None,
     max_pages: Optional[int] = None,
+    page_start: Optional[int] = None,
+    page_end: Optional[int] = None,
 ) -> Tuple[str, str, int, List[str]]:
     """
     Intenta nativo → (opcional) PyMuPDF → OCR.
 
     Returns:
         (texto_crudo, method, page_count, warnings)
-    page_count es el total del PDF; el texto puede estar truncado a max_pages.
+    page_count es el total del PDF; el texto puede estar limitado al rango pedido.
     """
     warnings: List[str] = []
-    page_limit = ocr_max_pages if max_pages is None else max_pages
-    text, pages = extract_native_pypdf(file_bytes, max_pages=page_limit)
+    # Rango explícito gana; max_pages / ocr_max_pages quedan como legacy "primeras N".
+    legacy_cap = max_pages if max_pages is not None else ocr_max_pages
+    range_kwargs = {
+        "page_start": page_start,
+        "page_end": page_end,
+        "max_pages": legacy_cap if page_start is None and page_end is None else None,
+    }
+
+    text, pages = extract_native_pypdf(file_bytes, **range_kwargs)
     method = "native"
-    if page_limit is not None and pages > int(page_limit):
+    start_0, end_excl, _ = _resolve_page_bounds(
+        pages,
+        page_start=page_start,
+        page_end=page_end,
+        max_pages=legacy_cap if page_start is None and page_end is None else None,
+    )
+    processed = max(0, end_excl - start_0)
+    if processed < pages:
         warnings.append(
-            f"PDF con {pages} páginas: se procesan solo las primeras {int(page_limit)}."
+            f"PDF con {pages} páginas: se procesan solo {start_0 + 1}–{end_excl} "
+            f"({processed} pág.)."
         )
 
     # Segunda pasada nativa si pypdf extrajo poco y hay PyMuPDF
-    if needs_ocr(text, max(pages, 1), min_chars_per_page=min_chars_per_page):
+    if needs_ocr(text, max(processed, 1), min_chars_per_page=min_chars_per_page):
         try:
-            text_m, pages_m = extract_native_pymupdf(file_bytes, max_pages=page_limit)
-            dens_base = _alphanumeric_density(text, max(min(pages, page_limit or pages), 1))
-            dens_m = _alphanumeric_density(text_m, max(min(pages_m, page_limit or pages_m), 1))
+            text_m, pages_m = extract_native_pymupdf(file_bytes, **range_kwargs)
+            dens_base = _alphanumeric_density(text, max(processed, 1))
+            dens_m = _alphanumeric_density(text_m, max(processed, 1))
             if dens_m > dens_base:
                 text, pages = text_m, pages_m
                 method = "native+pymupdf"
@@ -191,15 +289,15 @@ def extract_pdf_text_hybrid(
         except Exception as exc:
             warnings.append(f"PyMuPDF falló: {exc}")
 
-    dens_pages = max(min(pages, page_limit) if page_limit else pages, 1)
+    dens_pages = max(processed, 1)
     if allow_ocr and needs_ocr(text, dens_pages, min_chars_per_page=min_chars_per_page):
         try:
             text_ocr, pages_ocr = extract_ocr_tesseract(
                 file_bytes,
                 lang=ocr_lang,
-                max_pages=page_limit,
+                **range_kwargs,
             )
-            if _alphanumeric_density(text_ocr, max(pages_ocr, 1)) > _alphanumeric_density(
+            if _alphanumeric_density(text_ocr, max(processed, 1)) > _alphanumeric_density(
                 text, dens_pages
             ):
                 text, pages = text_ocr, pages if pages else pages_ocr
@@ -482,11 +580,14 @@ def process_pdf(
     ocr_max_pages: Optional[int] = None,
     source_filename: Optional[str] = None,
     max_pages: Optional[int] = None,
+    page_start: Optional[int] = None,
+    page_end: Optional[int] = None,
 ) -> ProcessedDocument:
     """
     Aduana completa: extracción híbrida → heal → chunks con overlap.
 
-    ``max_pages`` limita cuántas páginas se envían al LLM (PDFs largos).
+    ``page_start`` / ``page_end`` (1-indexados, inclusivos) limitan el capítulo a leer.
+    ``max_pages`` legacy: procesa solo las primeras N páginas.
     """
     if not file_bytes:
         return ProcessedDocument(
@@ -498,14 +599,16 @@ def process_pdf(
             },
         )
 
-    page_cap = max_pages if max_pages is not None else ocr_max_pages
+    legacy_cap = max_pages if max_pages is not None else ocr_max_pages
     raw, method, pages, warnings = extract_pdf_text_hybrid(
         file_bytes,
         min_chars_per_page=min_chars_per_page,
         allow_ocr=allow_ocr,
         ocr_lang=ocr_lang,
-        ocr_max_pages=page_cap,
-        max_pages=page_cap,
+        ocr_max_pages=legacy_cap,
+        max_pages=legacy_cap,
+        page_start=page_start,
+        page_end=page_end,
     )
     healed = heal_text(raw)
     chunks = chunk_text(
@@ -513,7 +616,13 @@ def process_pdf(
         chunk_tokens=chunk_tokens,
         overlap_ratio=overlap_ratio,
     )
-    processed_pages = min(pages, int(page_cap)) if page_cap is not None else pages
+    start_0, end_excl, _ = _resolve_page_bounds(
+        pages,
+        page_start=page_start,
+        page_end=page_end,
+        max_pages=legacy_cap if page_start is None and page_end is None else None,
+    )
+    processed_pages = max(0, end_excl - start_0)
     density = _alphanumeric_density(healed, max(processed_pages, 1))
     archivo = (source_filename or "").strip()[:255] or None
 
@@ -533,7 +642,9 @@ def process_pdf(
             "overlap_ratio": max(0.15, float(overlap_ratio)),
             "est_tokens_total": _estimate_tokens(healed) if healed else 0,
             "nombre_archivo_fuente": archivo,
-            "max_pages": page_cap,
+            "max_pages": legacy_cap,
+            "page_start": start_0 + 1 if pages else None,
+            "page_end": end_excl if pages else None,
             "pages_procesadas": processed_pages,
         },
     )
