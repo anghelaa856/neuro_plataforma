@@ -152,7 +152,7 @@ def _render_plan_semanal(plan: Dict[str, Any], *, usuario_id: int) -> None:
     if st.button(
         "🎯 Atacar mi cuello de botella",
         type="primary",
-        width="stretch",
+        use_container_width=True,
         key="dashboard_btn_atacar_cuello",
     ):
         _lanzar_practica_cuello(usuario_id=usuario_id, cuello=cuello)
@@ -342,7 +342,7 @@ def _render_numeros_detras(
         )
         st.dataframe(
             table.sort_values("% acierto", ascending=True),
-            width="stretch",
+            use_container_width=True,
             hide_index=True,
             column_config={
                 "% acierto": st.column_config.ProgressColumn(

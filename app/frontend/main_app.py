@@ -146,7 +146,7 @@ def render_auth_gate() -> bool:
         with st.form("login_form"):
             email = st.text_input("Email", key="login_email")
             password = st.text_input("Contraseña", type="password", key="login_password")
-            submitted = st.form_submit_button("Entrar", type="primary", width="stretch")
+            submitted = st.form_submit_button("Entrar", type="primary", use_container_width=True)
         if submitted:
             try:
                 auth = user_repository.authenticate(email=email, password=password)
@@ -165,7 +165,7 @@ def render_auth_gate() -> bool:
             email = st.text_input("Email", key="reg_email")
             password = st.text_input("Contraseña (mín. 6)", type="password", key="reg_password")
             password2 = st.text_input("Repetir contraseña", type="password", key="reg_password2")
-            submitted = st.form_submit_button("Crear cuenta", type="primary", width="stretch")
+            submitted = st.form_submit_button("Crear cuenta", type="primary", use_container_width=True)
         if submitted:
             if password != password2:
                 st.error("Las contraseñas no coinciden.")
@@ -208,7 +208,7 @@ def build_ui() -> None:
         )
     with top_r:
         st.write("")
-        if st.button("Cerrar sesión", width="stretch"):
+        if st.button("Cerrar sesión", use_container_width=True):
             _logout()
             st.rerun()
 
@@ -284,7 +284,7 @@ def render_ingesta_admin_tab() -> None:
         "Procesar y Guardar en Bóveda",
         type="primary",
         disabled=uploaded is None,
-        width="stretch",
+        use_container_width=True,
     ):
         if uploaded is None:
             st.error("Sube un PDF primero.")
@@ -404,7 +404,7 @@ def _render_cierre_resultado(resultado: ResultadoCierreBloque) -> None:
     if resultado.id_sesion:
         st.caption(f"Sesión simulacro `{resultado.id_sesion}` marcada como **finalizada**.")
     with st.expander("Detalle por pregunta"):
-        st.dataframe(resultado.detalle_por_pregunta, width="stretch")
+        st.dataframe(resultado.detalle_por_pregunta, use_container_width=True)
 
 
 def _clear_socratic_chats(*, modo_origen: Optional[str] = None) -> None:
@@ -531,7 +531,7 @@ def _render_socratic_tutor_panel(
             enviar = st.button(
                 "Enviar",
                 type="primary",
-                width="stretch",
+                use_container_width=True,
                 key=f"socratic_send::{storage_key}",
             )
 
@@ -639,7 +639,7 @@ def _render_mcq_review_with_tutor(
         if st.button(
             "← Anterior",
             disabled=idx <= 0,
-            width="stretch",
+            use_container_width=True,
             key=f"review_prev_{answers_key}",
         ):
             st.session_state[review_index_key] = idx - 1
@@ -650,7 +650,7 @@ def _render_mcq_review_with_tutor(
         if st.button(
             "Siguiente →",
             disabled=idx >= total - 1,
-            width="stretch",
+            use_container_width=True,
             key=f"review_next_{answers_key}",
         ):
             st.session_state[review_index_key] = idx + 1
@@ -772,7 +772,7 @@ def _render_mcq_navigator(
             if st.button(
                 "Comprobar Respuesta",
                 type="primary",
-                width="stretch",
+                use_container_width=True,
                 key=f"btn_check_{answers_key}_{qid}",
             ):
                 marcada = str(answers.get(qid) or choice or "").strip().upper()
@@ -801,7 +801,7 @@ def _render_mcq_navigator(
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("← Anterior", disabled=idx <= 0, width="stretch"):
+        if st.button("← Anterior", disabled=idx <= 0, use_container_width=True):
             st.session_state[index_key] = idx - 1
             st.rerun()
     with c2:
@@ -812,7 +812,7 @@ def _render_mcq_navigator(
         if st.button(
             "Siguiente →",
             disabled=(idx >= total - 1) or (not puede_avanzar),
-            width="stretch",
+            use_container_width=True,
             type="primary" if idx < total - 1 else "secondary",
             key=f"btn_next_{answers_key}_{idx}",
         ):
@@ -854,7 +854,7 @@ def _render_mcq_navigator(
         if st.button(
             finalize_label,
             type="primary",
-            width="stretch",
+            use_container_width=True,
             key=f"btn_fin_{answers_key}",
             disabled=not puede_finalizar,
         ):
@@ -903,9 +903,9 @@ def render_simulacro_oficial_tab() -> None:
 
     col_a, col_b = st.columns([2, 1])
     with col_a:
-        start = st.button("Iniciar Simulacro Oficial", type="primary", width="stretch")
+        start = st.button("Iniciar Simulacro Oficial", type="primary", use_container_width=True)
     with col_b:
-        if st.button("Reiniciar simulacro", width="stretch"):
+        if st.button("Reiniciar simulacro", use_container_width=True):
             st.session_state["simulacro_activo"] = None
             st.session_state["simulacro_index"] = 0
             st.session_state["simulacro_respuestas"] = {}
@@ -949,7 +949,7 @@ def render_simulacro_oficial_tab() -> None:
         return
 
     with st.expander("Composición por materia (prospecto)"):
-        st.dataframe(examen.composicion_por_materia, width="stretch")
+        st.dataframe(examen.composicion_por_materia, use_container_width=True)
 
     def _on_finalize_simulacro(respuestas: Dict[str, str], tiempos: Dict[str, int]):
         return tutor_engine.finalizar_simulacro_oficial(
@@ -1042,7 +1042,7 @@ def render_practica_enfocada_tab() -> None:
     if st.button(
         "🧠 Generar Práctica de mis Debilidades",
         type="primary",
-        width="stretch",
+        use_container_width=True,
         key="practica_btn_debilidades",
     ):
         try:
@@ -1098,9 +1098,9 @@ def render_practica_enfocada_tab() -> None:
 
     c1, c2 = st.columns(2)
     with c1:
-        generar = st.button("Generar Práctica", type="secondary", width="stretch")
+        generar = st.button("Generar Práctica", type="secondary", use_container_width=True)
     with c2:
-        if st.button("Limpiar práctica", width="stretch"):
+        if st.button("Limpiar práctica", use_container_width=True):
             _reset_practica_session_state()
             st.rerun()
 

@@ -133,7 +133,7 @@ def render_student_ingestion_tab(*, usuario_id: int) -> None:
         "Analizar mi guía con IA",
         type="primary",
         disabled=uploaded is None,
-        width="stretch",
+        use_container_width=True,
         key="student_ingesta_run",
     ):
         if uploaded is None:
