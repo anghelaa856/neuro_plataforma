@@ -19,6 +19,7 @@ from app.services.banco_extraction_service import (
     extract_banco_preguntas_from_chunks,
     extract_banco_preguntas_from_images,
 )
+from app.services.content_service import compress_image_bytes
 from app.services.pdf_processor import process_pdf
 
 # Umbral a partir del cual pedimos acotar páginas
@@ -91,7 +92,8 @@ def _normalize_uploader_value(uploaded: Any) -> List[Any]:
 def _persist_uploaded_files(uploaded_list: Sequence[Any]) -> None:
     """
     Copia inmediata del lote del widget → session_state (merge por id).
-    Si el widget vuelve vacío en el siguiente rerun (móvil), la lista se conserva.
+    Las fotos se comprimen YA (≤1024px, JPEG q70) para no guardar originales
+    de alta resolución en RAM del Space.
     """
     if not uploaded_list:
         return
@@ -105,11 +107,26 @@ def _persist_uploaded_files(uploaded_list: Sequence[Any]) -> None:
     for uploaded in uploaded_list:
         name = str(getattr(uploaded, "name", None) or "archivo")
         raw = bytes(uploaded.getvalue())
-        size = getattr(uploaded, "size", None)
-        file_id = f"{name}:{size if size is not None else len(raw)}"
+        ext = _file_ext(name)
+        if ext in _IMAGE_EXTS:
+            try:
+                raw = compress_image_bytes(raw, max_side=1024, jpeg_quality=70)
+                # Normalizar extensión lógica (siempre JPEG tras compress)
+                if not name.lower().endswith((".jpg", ".jpeg")):
+                    base = name.rsplit(".", 1)[0] if "." in name else name
+                    name = f"{base}.jpg"
+            except Exception:
+                # Si Pillow falla, no bloqueamos el lote; la IA intentará después.
+                pass
+        size = len(raw)
+        file_id = f"{name}:{size}"
         by_id[file_id] = {"id": file_id, "name": name, "bytes": raw}
+        del raw
 
     st.session_state[_SS_FILES] = list(by_id.values())
+    import gc
+
+    gc.collect()
 
 
 def _persisted_files() -> List[Dict[str, Any]]:
@@ -281,8 +298,8 @@ def render_student_ingestion_tab(*, usuario_id: int) -> None:
 
     if images:
         st.caption(
-            "Modo foto (lote): la IA procesará cada imagen en secuencia "
-            "(más estable que un único payload enorme)."
+            "Modo foto (lote): cada imagen se comprime (máx. 1024px, JPEG) y "
+            "se analiza de a una para no saturar la memoria del servidor."
         )
         preview_n = min(6, len(images))
         cols = st.columns(min(3, preview_n))

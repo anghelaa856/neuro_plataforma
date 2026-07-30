@@ -126,17 +126,20 @@ def _clean_source_text(text: str) -> str:
     return cleaned.strip()
 
 
-def image_bytes_to_data_url(
+def compress_image_bytes(
     image_bytes: bytes,
     *,
-    max_side: int = 2048,
-    jpeg_quality: int = 85,
-) -> str:
+    max_side: int = 1024,
+    jpeg_quality: int = 70,
+) -> bytes:
     """
-    Normaliza una foto (JPG/PNG) a data-URL JPEG base64 para visión multimodal.
-    Reduce lado mayor a ``max_side`` para no saturar el payload de OpenRouter.
+    Redimensiona y comprime una foto a JPEG liviano (RAM-friendly para Spaces).
+
+    - Lado mayor ≤ ``max_side`` (default 1024)
+    - JPEG ``optimize=True``, ``quality`` default 70
+    Libera buffers Pillow al terminar.
     """
-    import base64
+    import gc
     from io import BytesIO
 
     from PIL import Image
@@ -144,26 +147,83 @@ def image_bytes_to_data_url(
     if not image_bytes:
         raise ValueError("Imagen vacía.")
 
-    img = Image.open(BytesIO(image_bytes))
-    img.load()
-    if img.mode in ("RGBA", "P", "LA"):
-        img = img.convert("RGB")
-    elif img.mode != "RGB":
-        img = img.convert("RGB")
+    src = BytesIO(image_bytes)
+    img = None
+    out_buf = None
+    try:
+        img = Image.open(src)
+        img.load()
+        if img.mode in ("RGBA", "P", "LA"):
+            converted = img.convert("RGB")
+            img.close()
+            img = converted
+        elif img.mode != "RGB":
+            converted = img.convert("RGB")
+            img.close()
+            img = converted
 
-    w, h = img.size
-    side = max(w, h)
-    if side > int(max_side) > 0:
-        ratio = float(max_side) / float(side)
-        img = img.resize(
-            (max(1, int(w * ratio)), max(1, int(h * ratio))),
-            Image.Resampling.LANCZOS,
+        w, h = img.size
+        side = max(w, h)
+        if side > int(max_side) > 0:
+            ratio = float(max_side) / float(side)
+            # BILINEAR: menos pico de RAM que LANCZOS en contenedores chicos
+            resized = img.resize(
+                (max(1, int(w * ratio)), max(1, int(h * ratio))),
+                Image.Resampling.BILINEAR,
+            )
+            img.close()
+            img = resized
+
+        out_buf = BytesIO()
+        img.save(
+            out_buf,
+            format="JPEG",
+            quality=max(40, min(85, int(jpeg_quality))),
+            optimize=True,
         )
+        return out_buf.getvalue()
+    finally:
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
+        del img
+        del src
+        del out_buf
+        gc.collect()
 
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=max(40, min(95, int(jpeg_quality))), optimize=True)
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/jpeg;base64,{b64}"
+
+def image_bytes_to_data_url(
+    image_bytes: bytes,
+    *,
+    max_side: int = 1024,
+    jpeg_quality: int = 70,
+) -> str:
+    """
+    Normaliza una foto a data-URL JPEG base64 para visión multimodal.
+    Comprime ANTES del Base64 (1024px / quality 70) para evitar OOM en Spaces.
+    """
+    import base64
+    import gc
+
+    if not image_bytes:
+        raise ValueError("Imagen vacía.")
+
+    compressed: Optional[bytes] = None
+    b64: Optional[str] = None
+    try:
+        compressed = compress_image_bytes(
+            image_bytes,
+            max_side=max_side,
+            jpeg_quality=jpeg_quality,
+        )
+        b64 = base64.b64encode(compressed).decode("ascii")
+        return f"data:image/jpeg;base64,{b64}"
+    finally:
+        del compressed
+        del b64
+        gc.collect()
 
 
 def _openrouter_chat(

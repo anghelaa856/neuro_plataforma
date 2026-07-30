@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import gc
 import re
 import time
 from dataclasses import dataclass, field
@@ -571,14 +572,30 @@ class BancoExtractionService:
         )
 
         try:
-            data_url = image_bytes_to_data_url(image_bytes)
-            raw = _openrouter_chat(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                max_tokens=4500,
-                image_data_url=data_url,
-            )
-            payload = json.loads(_strip_code_fences(raw))
+            data_url: Optional[str] = None
+            raw: Optional[str] = None
+            try:
+                # Comprime (1024px / q70) → Base64; una sola imagen en RAM.
+                data_url = image_bytes_to_data_url(
+                    image_bytes,
+                    max_side=1024,
+                    jpeg_quality=70,
+                )
+                raw = _openrouter_chat(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    max_tokens=4500,
+                    image_data_url=data_url,
+                )
+            finally:
+                # Liberar payload multimodal antes de parsear JSON.
+                if data_url is not None:
+                    del data_url
+                gc.collect()
+
+            payload = json.loads(_strip_code_fences(raw or ""))
+            del raw
+            raw = None
             validated = ExtraccionBancoPayload.from_raw(
                 payload, default_materia_nombre=materia_fija_nombre
             )
@@ -596,6 +613,8 @@ class BancoExtractionService:
                 items=[],
                 raw_error=f"{type(exc).__name__}: {exc}",
             )
+        finally:
+            gc.collect()
 
     def extract_and_persist_from_chunks(
         self,
@@ -873,8 +892,21 @@ class BancoExtractionService:
                     f"(clasificando materias · excluyendo {len(temas_excluidos)} tema(s))…",
                 )
 
+            # Estrictamente 1 imagen en vuelo: copiar bytes locales y soltar el slot.
+            one_bytes = img.get("bytes")
+            if one_bytes is None:
+                warnings.append(f"foto[{idx}]: sin bytes.")
+                continue
+            raw_one = bytes(one_bytes)
+            # No retener el original en la lista (evita acumular N fotos full-res).
+            try:
+                img["bytes"] = b""
+            except Exception:
+                pass
+            del one_bytes
+
             result = self.extract_items_from_image(
-                bytes(img["bytes"]),
+                raw_one,
                 materias_oficiales=materias,
                 max_items=per_img,
                 image_index=idx,
@@ -883,6 +915,9 @@ class BancoExtractionService:
                 materia_fija_nombre=fija_nombre,
                 nombre_archivo=nombre_img,
             )
+            del raw_one
+            gc.collect()
+
             chunk_results.append(result)
             if result.raw_error:
                 warnings.append(f"foto[{idx}]: {result.raw_error}")
@@ -902,6 +937,9 @@ class BancoExtractionService:
                 if key and key not in temas_excluidos_norm:
                     temas_excluidos_norm.add(key)
                     temas_excluidos.append(item.tema_especifico)
+
+            del result
+            gc.collect()
 
             if idx < total - 1 and pause_between_images_s > 0:
                 time.sleep(float(pause_between_images_s))
