@@ -1,7 +1,8 @@
-"""Servicios ML desacoplados para evaluación cognitiva."""
+"""
+Paquete ML activo.
 
-from app.ml.anomaly_service import TimeAnomalyService
-from app.ml.interval_policy import IntervalPolicyService
-from app.ml.nlp_service import SemanticNLPService
+El scoring NLP / anomalías / SM-2 híbrido legacy fue archivado en:
+`app.archive.legacy_nlp_system`
+"""
 
-__all__ = ["SemanticNLPService", "TimeAnomalyService", "IntervalPolicyService"]
+__all__: list[str] = []

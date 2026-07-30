@@ -6,6 +6,7 @@ from app.services.banco_extraction_service import (
     ItemBancoGenerado,
     banco_extraction_service,
     extract_banco_preguntas_from_chunks,
+    extract_banco_preguntas_from_images,
 )
 from app.services.content_service import (
     ExtractedCard,
@@ -14,7 +15,6 @@ from app.services.content_service import (
     extract_study_cards,
     mutate_question_for_review,
 )
-from app.services.evaluation_service import EvaluationResult, evaluate_answer
 from app.services.pdf_processor import ProcessedDocument, chunk_text, heal_text, process_pdf
 from app.services.simulacro_engine import (
     BancoInsuficienteError,
@@ -27,14 +27,20 @@ from app.services.simulacro_engine import (
 from app.services.tutor_engine import (
     PracticaEnfocada,
     PreguntaTutor,
+    ResultadoCierreBloque,
     SimulacroOficial,
     TutorEngine,
     tutor_engine,
 )
+from app.services.tutor_socratico_service import (
+    ChatTurn,
+    SocraticTutorReply,
+    SocraticTutorService,
+    TutorContext,
+    socratic_tutor_service,
+)
 
 __all__ = [
-    "EvaluationResult",
-    "evaluate_answer",
     "ExtractedCard",
     "ExtractionResult",
     "extract_study_cards",
@@ -45,6 +51,7 @@ __all__ = [
     "ItemBancoGenerado",
     "banco_extraction_service",
     "extract_banco_preguntas_from_chunks",
+    "extract_banco_preguntas_from_images",
     "ProcessedDocument",
     "chunk_text",
     "heal_text",
@@ -57,7 +64,13 @@ __all__ = [
     "simulacro_engine",
     "PracticaEnfocada",
     "PreguntaTutor",
+    "ResultadoCierreBloque",
     "SimulacroOficial",
     "TutorEngine",
     "tutor_engine",
+    "TutorContext",
+    "ChatTurn",
+    "SocraticTutorReply",
+    "SocraticTutorService",
+    "socratic_tutor_service",
 ]

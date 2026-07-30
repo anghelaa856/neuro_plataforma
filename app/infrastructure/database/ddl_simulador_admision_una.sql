@@ -168,6 +168,9 @@ CREATE TABLE IF NOT EXISTS banco_preguntas (
     justificacion           TEXT            NOT NULL,
     -- Metadatos de curaduría (no de dificultad dinámica)
     fuente                  VARCHAR(120),
+    nombre_archivo_fuente   VARCHAR(255),            -- nombre del PDF/upload de origen
+    -- NULL = banco oficial (admin); ID = pregunta privada del alumno (Fase 7)
+    propietario_usuario_id  BIGINT,
     anio_referencia         SMALLINT,
     hash_contenido          CHAR(64)        NOT NULL,  -- SHA-256 del enunciado+alts (dedup)
     activa                  BOOLEAN         NOT NULL DEFAULT TRUE,
@@ -182,21 +185,33 @@ CREATE TABLE IF NOT EXISTS banco_preguntas (
             AND alternativas ? 'C'
             AND alternativas ? 'D'
             AND alternativas ? 'E'
-            AND (SELECT count(*) FROM jsonb_object_keys(alternativas)) = 5
         ),
     CONSTRAINT ck_banco_enunciado_no_vacio
         CHECK (length(btrim(enunciado)) >= 10),
     CONSTRAINT ck_banco_justificacion_no_vacia
-        CHECK (length(btrim(justificacion)) >= 5),
-    CONSTRAINT uq_banco_hash_contenido
-        UNIQUE (hash_contenido)
+        CHECK (length(btrim(justificacion)) >= 5)
 );
+
+-- Compat DBs pre-Fase 7/8: CREATE TABLE IF NOT EXISTS no añade columnas a tablas viejas.
+-- Estos ALTER DEBEN ir antes de COMMENT/INDEX que referencien las columnas.
+ALTER TABLE banco_preguntas
+    ADD COLUMN IF NOT EXISTS nombre_archivo_fuente VARCHAR(255);
+ALTER TABLE banco_preguntas
+    ADD COLUMN IF NOT EXISTS propietario_usuario_id BIGINT;
 
 COMMENT ON TABLE banco_preguntas IS
     'Bóveda de ítems append-only. Sin columna de dificultad fija: se deriva '
     'de historial_intentos (tasa de error). Soft-delete vía activa=FALSE.';
 COMMENT ON COLUMN banco_preguntas.alternativas IS
     'Mapa JSONB A..E alineado a ficha óptica UNA (5 alternativas).';
+COMMENT ON COLUMN banco_preguntas.nombre_archivo_fuente IS
+    'Nombre del archivo PDF/upload del que se extrajo el ítem (trazabilidad de ingesta).';
+COMMENT ON COLUMN banco_preguntas.propietario_usuario_id IS
+    'NULL = ítem del banco oficial (admin). Valor = pregunta privada del alumno (aislamiento).';
+
+-- Dedup por dueño (0 = oficial). Evita que la guía de un alumno contamine a otro.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_banco_hash_propietario
+    ON banco_preguntas (hash_contenido, (COALESCE(propietario_usuario_id, 0)));
 
 CREATE INDEX IF NOT EXISTS idx_banco_preguntas_tema_id
     ON banco_preguntas (tema_id)
@@ -204,6 +219,10 @@ CREATE INDEX IF NOT EXISTS idx_banco_preguntas_tema_id
 
 CREATE INDEX IF NOT EXISTS idx_banco_preguntas_activa
     ON banco_preguntas (activa);
+
+CREATE INDEX IF NOT EXISTS idx_banco_preguntas_propietario
+    ON banco_preguntas (propietario_usuario_id)
+    WHERE activa;
 
 -- Impide mutar enunciado/alternativas/clave (inmutabilidad de contenido)
 CREATE OR REPLACE FUNCTION fn_bloquear_mutacion_banco_contenido()

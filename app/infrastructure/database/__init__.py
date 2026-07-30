@@ -3,9 +3,20 @@
 from app.infrastructure.database.admission_schema import ensure_admission_schema
 from app.infrastructure.database.banco_repository import BancoRepository, banco_repository
 from app.infrastructure.database.connection import DatabaseConnection, db_connection
+from app.infrastructure.database.historial_repository import (
+    CierreSesionSimulacro,
+    HistorialRepository,
+    IntentoLedger,
+    historial_repository,
+)
 from app.infrastructure.database.repositories import MemoryCardRepository, memory_card_repository
 from app.infrastructure.database.schema import ensure_schema
 from app.infrastructure.database.seed_catalogo_materias import seed_catalogo_materias
+from app.infrastructure.database.tutor_interacciones_repository import (
+    TutorInteraccionInsert,
+    TutorInteraccionesRepository,
+    tutor_interacciones_repository,
+)
 from app.infrastructure.database.user_repository import UserRepository, user_repository
 
 __all__ = [
@@ -16,8 +27,15 @@ __all__ = [
     "seed_catalogo_materias",
     "BancoRepository",
     "banco_repository",
+    "HistorialRepository",
+    "historial_repository",
+    "IntentoLedger",
+    "CierreSesionSimulacro",
     "MemoryCardRepository",
     "memory_card_repository",
+    "TutorInteraccionInsert",
+    "TutorInteraccionesRepository",
+    "tutor_interacciones_repository",
     "UserRepository",
     "user_repository",
 ]

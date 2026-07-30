@@ -126,7 +126,60 @@ def _clean_source_text(text: str) -> str:
     return cleaned.strip()
 
 
-def _openrouter_chat(system_prompt: str, user_prompt: str, max_tokens: int = 3500) -> str:
+def image_bytes_to_data_url(
+    image_bytes: bytes,
+    *,
+    max_side: int = 2048,
+    jpeg_quality: int = 85,
+) -> str:
+    """
+    Normaliza una foto (JPG/PNG) a data-URL JPEG base64 para visión multimodal.
+    Reduce lado mayor a ``max_side`` para no saturar el payload de OpenRouter.
+    """
+    import base64
+    from io import BytesIO
+
+    from PIL import Image
+
+    if not image_bytes:
+        raise ValueError("Imagen vacía.")
+
+    img = Image.open(BytesIO(image_bytes))
+    img.load()
+    if img.mode in ("RGBA", "P", "LA"):
+        img = img.convert("RGB")
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
+    w, h = img.size
+    side = max(w, h)
+    if side > int(max_side) > 0:
+        ratio = float(max_side) / float(side)
+        img = img.resize(
+            (max(1, int(w * ratio)), max(1, int(h * ratio))),
+            Image.Resampling.LANCZOS,
+        )
+
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=max(40, min(95, int(jpeg_quality))), optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def _openrouter_chat(
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 3500,
+    *,
+    image_data_url: Optional[str] = None,
+) -> str:
+    """
+    Chat OpenRouter compatible OpenAI.
+
+    Sin imagen: ``content`` es string (flujo PDF / texto, sin cambios).
+    Con imagen: ``content`` es lista multimodal
+    ``[{type:text}, {type:image_url}]``.
+    """
     key = (settings.openrouter_api_key or "").strip()
     if not key or key.lower().startswith("your_"):
         raise RuntimeError(
@@ -141,25 +194,41 @@ def _openrouter_chat(system_prompt: str, user_prompt: str, max_tokens: int = 350
         "HTTP-Referer": settings.openrouter_site_url,
         "X-Title": settings.openrouter_app_name,
     }
+
+    user_content: Any
+    if image_data_url:
+        data_url = str(image_data_url).strip()
+        if not data_url.startswith("data:image/"):
+            raise ValueError(
+                "image_data_url inválida: se espera data:image/...;base64,..."
+            )
+        user_content = [
+            {"type": "text", "text": user_prompt},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]
+    else:
+        user_content = user_prompt
+
     payload: Dict[str, Any] = {
         "model": settings.openrouter_model,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_content},
         ],
         "temperature": 0.35,
         "max_tokens": max_tokens,
     }
     logger.info(
-        "OpenRouter extracción: modelo=%s, prompt_chars=%s",
+        "OpenRouter extracción: modelo=%s, prompt_chars=%s, multimodal=%s",
         settings.openrouter_model,
         len(user_prompt),
+        bool(image_data_url),
     )
     response = requests.post(
         url,
         headers=headers,
         json=payload,
-        timeout=120,
+        timeout=180 if image_data_url else 120,
         verify=ssl_verify(),  # truststore (CA del SO) o fallback certifi.where()
     )
     if response.status_code >= 400:
@@ -343,6 +412,11 @@ def extract_study_cards(
     """
     Extrae ~10 tarjetas con OpenRouter (Diseñador Instruccional / Duolingo).
     Si falla la API, degrada a fallback local y lo declara explícitamente.
+
+    Nota: la UI de flashcards fue archivada en
+    ``app.archive.legacy_nlp_system``. Esta función se conserva porque
+    reutiliza el mismo cliente OpenRouter y puede alimentar Fase 4.
+    El runtime UNA de ingesta usa ``banco_extraction_service``.
     """
     text = (content_text or "").strip()
     if len(text) < 40:

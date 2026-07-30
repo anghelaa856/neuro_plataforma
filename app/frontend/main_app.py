@@ -13,46 +13,20 @@ from app.database.db_manager import db_manager
 from app.infrastructure.database.banco_repository import banco_repository
 from app.infrastructure.database.seed_catalogo_materias import seed_catalogo_materias
 from app.infrastructure.database.user_repository import user_repository
-from app.ml.interval_policy import IntervalPolicyService
 from app.services.banco_extraction_service import extract_banco_preguntas_from_chunks
-from app.services.content_service import (
-    ExtractedCard,
-    cards_to_table_rows,
-    extract_study_cards,
-    mutate_question_for_review,
-)
-from app.services.evaluation_service import EvaluationResult, evaluate_answer, interval_policy
 from app.services.pdf_processor import process_pdf
 from app.services.tutor_engine import (
     BancoInsuficienteError,
     CatalogoInvalidoError,
+    ResultadoCierreBloque,
     tutor_engine,
 )
-
-STUDENT_HISTORY_COLUMNS = [
-    "id_tarjeta",
-    "area",
-    "tema",
-    "pregunta",
-    "modo_tarjeta",
-    "nivel_dificultad",
-    "nota_ia",
-    "auditoria_estado",
-    "intervalo_recomendado_dias",
-    "plan_estudio",
-    "creado_en",
-]
-
-DUE_COLUMNS = [
-    "id_tarjeta",
-    "area",
-    "tema",
-    "pregunta",
-    "modo_tarjeta",
-    "nivel_dificultad",
-    "intervalo_recomendado_dias",
-    "fecha_repaso",
-]
+from app.services.tutor_socratico_service import (
+    TutorContext,
+    socratic_tutor_service,
+)
+from app.frontend.render_student_dashboard_tab import render_student_dashboard_tab
+from app.frontend.render_student_ingestion_tab import render_student_ingestion_tab
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
@@ -63,42 +37,6 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 def init_runtime() -> None:
     defaults: Dict[str, Any] = {
-        # Estudio activo
-        "question_started_at": None,
-        "answer_submitted": False,
-        "session_locked": False,
-        "last_evaluation": None,
-        "last_card_id": None,
-        "last_reference_text": "",
-        "active_card_id": None,
-        "active_question_original": "",
-        "active_display_question": "",
-        "active_reference": "",
-        "active_area": "",
-        "active_tema": "",
-        "active_modo_tarjeta": "concepto",
-        "active_nivel_dificultad": 1,
-        "active_repetitions": 0,
-        "active_easiness": 2.5,
-        "active_interval_days": 1,
-        "active_is_mutated": False,
-        "mutation_detail": "",
-        "mutation_cache": {},  # card_id -> pregunta mutada
-        "study_queue": [],
-        "study_queue_index": 0,
-        "study_queue_loaded_at": None,
-        "study_queue_owner_id": None,
-        # Carga / extracción
-        "pdf_text": "",
-        "pdf_chunks": [],
-        "pdf_method": "",
-        "pdf_warnings": [],
-        "proposed_cards": [],
-        "extraction_detail": "",
-        "extraction_source": "",
-        "plan_estudio": IntervalPolicyService.PLAN_RETENCION,
-        "career_hint": "",
-        "form_key_counter": 0,
         # Auth multiusuario
         "auth_user": None,
         "usuario_id": None,
@@ -107,9 +45,21 @@ def init_runtime() -> None:
         "simulacro_activo": None,
         "simulacro_index": 0,
         "simulacro_respuestas": {},
+        "simulacro_tiempos_ms": {},
+        "simulacro_resultado": None,
+        "simulacro_cerrado": False,
         "practica_activa": None,
         "practica_index": 0,
         "practica_respuestas": {},
+        "practica_tiempos_ms": {},
+        "practica_resultado": None,
+        "practica_cerrada": False,
+        # Active Recall: qid → True tras "Comprobar Respuesta"
+        "practica_respuestas__comprobadas": {},
+        "practica_respuestas__check_ok": {},
+        # Tutor socrático (historial por pregunta; nunca guarda la clave)
+        "socratic_chats": {},
+        "socratic_justificacion_cache": {},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -152,7 +102,7 @@ def _effective_usuario_id() -> int:
 
 
 def _establish_user_session(auth: Dict[str, Any]) -> None:
-    """Guarda el usuario en session_state y limpia cola de estudio ajena."""
+    """Guarda el usuario en session_state y limpia estado de bloque UNA ajeno."""
     uid = int(auth["id_usuario"])
     st.session_state["auth_user"] = {
         "id_usuario": uid,
@@ -160,27 +110,22 @@ def _establish_user_session(auth: Dict[str, Any]) -> None:
         "nombre": auth["nombre"],
     }
     st.session_state["usuario_id"] = uid
-    st.session_state["study_queue"] = []
-    st.session_state["study_queue_index"] = 0
-    st.session_state["study_queue_owner_id"] = None
-    st.session_state["study_queue_loaded_at"] = None
-    st.session_state["active_card_id"] = None
-    st.session_state["mutation_cache"] = {}
-    st.session_state["proposed_cards"] = []
-    _reset_answer_controls()
+    # Limpia bloques MCQ / tutor de la sesión previa
+    st.session_state["simulacro_activo"] = None
+    st.session_state["practica_activa"] = None
+    st.session_state["practica_respuestas__comprobadas"] = {}
+    st.session_state["practica_respuestas__check_ok"] = {}
+    st.session_state["socratic_chats"] = {}
 
 
 def _logout() -> None:
     st.session_state["auth_user"] = None
     st.session_state["usuario_id"] = None
-    st.session_state["study_queue"] = []
-    st.session_state["study_queue_index"] = 0
-    st.session_state["study_queue_owner_id"] = None
-    st.session_state["study_queue_loaded_at"] = None
-    st.session_state["active_card_id"] = None
-    st.session_state["proposed_cards"] = []
-    st.session_state["mutation_cache"] = {}
-    _reset_answer_controls()
+    st.session_state["simulacro_activo"] = None
+    st.session_state["practica_activa"] = None
+    st.session_state["practica_respuestas__comprobadas"] = {}
+    st.session_state["practica_respuestas__check_ok"] = {}
+    st.session_state["socratic_chats"] = {}
 
 
 def render_auth_gate() -> bool:
@@ -242,530 +187,6 @@ def render_auth_gate() -> bool:
     return False
 
 
-def _reset_answer_controls() -> None:
-    st.session_state["question_started_at"] = None
-    st.session_state["answer_submitted"] = False
-    st.session_state["session_locked"] = False
-    st.session_state["last_evaluation"] = None
-    st.session_state["last_card_id"] = None
-
-
-def _answer_input_key(card_id: Any = None) -> str:
-    """Key dinámica: tarjeta + contador → widget nuevo y vacío al incrementar."""
-    cid = card_id if card_id is not None else st.session_state.get("active_card_id")
-    counter = int(st.session_state.get("form_key_counter") or 0)
-    return f"respuesta_input_{cid if cid is not None else 'none'}_{counter}"
-
-
-def _bump_answer_form_key() -> None:
-    """Invalida el text_area actual sin tocar su session_state (evita StreamlitAPIException)."""
-    st.session_state["form_key_counter"] = int(st.session_state.get("form_key_counter") or 0) + 1
-
-
-def _refresh_study_queue(force: bool = False) -> List[Dict[str, Any]]:
-    """Carga/recarga la cola de repasos del usuario logueado."""
-    usuario_id = _require_usuario_id()
-    owner = st.session_state.get("study_queue_owner_id")
-    if owner is not None and int(owner) != usuario_id:
-        force = True
-
-    queue = list(st.session_state.get("study_queue") or [])
-    if force or not queue:
-        try:
-            queue = db_manager.fetch_due_study_cards(usuario_id=usuario_id, limit=30)
-        except Exception:
-            queue = []
-        st.session_state["study_queue"] = queue
-        st.session_state["study_queue_index"] = 0
-        st.session_state["study_queue_owner_id"] = usuario_id
-        st.session_state["study_queue_loaded_at"] = time.time()
-    return queue
-
-
-def _prepare_card_for_study(card: Dict[str, Any]) -> None:
-    """Fija tarjeta activa y muta la pregunta si ya fue repasada antes."""
-    card_id = int(card.get("id_tarjeta"))
-    original = str(card.get("pregunta") or "").strip()
-    reference = str(card.get("respuesta_referencia") or "").strip()
-    reps = int(card.get("repetitions_count") or 0)
-    modo = str(card.get("modo_tarjeta") or "concepto").lower()
-    nivel = int(card.get("nivel_dificultad") or 1)
-
-    st.session_state["active_card_id"] = card_id
-    st.session_state["active_question_original"] = original
-    st.session_state["active_reference"] = reference
-    st.session_state["active_area"] = str(card.get("area") or "General")
-    st.session_state["active_tema"] = str(card.get("tema") or "General")
-    st.session_state["active_modo_tarjeta"] = modo
-    st.session_state["active_nivel_dificultad"] = max(1, min(3, nivel))
-    st.session_state["active_repetitions"] = reps
-    st.session_state["active_easiness"] = float(card.get("easiness_factor") or 2.5)
-    st.session_state["active_interval_days"] = int(card.get("intervalo_recomendado_dias") or 1)
-
-    cache: Dict[Any, str] = dict(st.session_state.get("mutation_cache") or {})
-    if reps > 0:
-        if card_id in cache and cache[card_id].strip():
-            display = cache[card_id]
-            detail = "Pregunta mutada (caché de sesión)."
-            method_ok = True
-        else:
-            mutation = mutate_question_for_review(
-                pregunta_original=original,
-                respuesta_referencia=reference,
-                modo_tarjeta=modo,
-                nivel_dificultad=nivel,
-            )
-            display = mutation.pregunta_mutada
-            detail = mutation.detail
-            cache[card_id] = display
-            st.session_state["mutation_cache"] = cache
-            method_ok = mutation.method.startswith("openrouter")
-        st.session_state["active_display_question"] = display
-        st.session_state["active_is_mutated"] = True
-        st.session_state["mutation_detail"] = detail
-        if not method_ok and "local" in detail.lower():
-            st.session_state["mutation_detail"] = detail
-    else:
-        st.session_state["active_display_question"] = original
-        st.session_state["active_is_mutated"] = False
-        st.session_state["mutation_detail"] = "Primera vez: pregunta original (sin mutación)."
-
-
-def _advance_study_queue() -> None:
-    _bump_answer_form_key()
-    queue = list(st.session_state.get("study_queue") or [])
-    idx = int(st.session_state.get("study_queue_index") or 0)
-    if idx + 1 < len(queue):
-        st.session_state["study_queue_index"] = idx + 1
-        _prepare_card_for_study(queue[idx + 1])
-    else:
-        # Recargar cola tras terminar el lote.
-        st.session_state["study_queue"] = []
-        st.session_state["study_queue_index"] = 0
-        st.session_state["active_card_id"] = None
-        st.session_state["active_display_question"] = ""
-        st.session_state["active_question_original"] = ""
-    _reset_answer_controls()
-
-
-def _approve_proposed_cards(
-    cards: List[ExtractedCard],
-    plan_estudio: str,
-    origen_contenido: str,
-) -> List[int]:
-    usuario_id = _require_usuario_id()
-    ids: List[int] = []
-    for card in cards:
-        card_id = db_manager.insert_memory_card(
-            usuario_id=usuario_id,
-            area=card.area,
-            tema=card.tema,
-            pregunta=card.pregunta,
-            respuesta_referencia=card.respuesta_referencia,
-            respuesta_estudiante=None,
-            nota_ia=None,
-            auditoria_estado="Pendiente",
-            auditoria_tiempo_ms=None,
-            intervalo_recomendado_dias=1,
-            plan_estudio=plan_estudio,
-            tipo_pregunta="open",
-            modo_simulacro=False,
-            origen_contenido=origen_contenido,
-            repetitions_count=0,
-            easiness_factor=2.5,
-            modo_tarjeta=card.modo_tarjeta,
-            nivel_dificultad=card.nivel_dificultad,
-        )
-        ids.append(card_id)
-    # Invalida cola para que Estudiar vea las nuevas.
-    st.session_state["study_queue"] = []
-    return ids
-
-
-# ---------------------------------------------------------------------------
-# Pestaña 1 — Estudiar
-# ---------------------------------------------------------------------------
-def render_study_tab() -> None:
-    st.subheader("📚 Estudiar (Repasos adaptativos)")
-    st.caption(
-        "Si la tarjeta ya fue repasada, verás una pregunta mutada. "
-        "La calificación usa siempre la respuesta de referencia original."
-    )
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("Actualizar cola de hoy", width="stretch"):
-            _refresh_study_queue(force=True)
-            st.session_state["active_card_id"] = None
-            _reset_answer_controls()
-            st.rerun()
-    with col_b:
-        plan_estudio = st.selectbox(
-            "Plan al guardar el repaso",
-            options=[IntervalPolicyService.PLAN_INTENSIVO, IntervalPolicyService.PLAN_RETENCION],
-            index=0
-            if st.session_state.get("plan_estudio") == IntervalPolicyService.PLAN_INTENSIVO
-            else 1,
-            key="plan_estudio_study",
-        )
-        st.session_state["plan_estudio"] = plan_estudio
-
-    queue = _refresh_study_queue(force=False)
-    if not queue:
-        st.success("No tienes repasos pendientes ni vencidos. Carga material en la pestaña ➕.")
-        return
-
-    idx = int(st.session_state.get("study_queue_index") or 0)
-    idx = max(0, min(idx, len(queue) - 1))
-    st.session_state["study_queue_index"] = idx
-    current = queue[idx]
-
-    # Preparar tarjeta solo si cambió el id activo (evita remutar al cambiar de tab).
-    if st.session_state.get("active_card_id") != int(current.get("id_tarjeta")):
-        with st.spinner("Preparando tarjeta adaptativa..."):
-            _prepare_card_for_study(current)
-        _bump_answer_form_key()
-
-    st.progress((idx + 1) / len(queue), text=f"Tarjeta {idx + 1} de {len(queue)}")
-
-    area = st.session_state.get("active_area", "")
-    tema = st.session_state.get("active_tema", "")
-    modo = st.session_state.get("active_modo_tarjeta", "concepto")
-    nivel = int(st.session_state.get("active_nivel_dificultad") or 1)
-    display_q = str(st.session_state.get("active_display_question") or "")
-    reference = str(st.session_state.get("active_reference") or "")
-    is_mutated = bool(st.session_state.get("active_is_mutated"))
-
-    st.markdown(f"**Área:** {area} · **Tema:** {tema}")
-    st.markdown(
-        f"**Modo:** `{modo}` · **Nivel:** `{nivel}` · "
-        f"**Repeticiones previas:** `{st.session_state.get('active_repetitions', 0)}`"
-    )
-
-    if is_mutated:
-        st.info("🧬 Pregunta mutada (anti-loro). La referencia de evaluación no cambia.")
-        if st.session_state.get("mutation_detail"):
-            st.caption(st.session_state["mutation_detail"])
-    else:
-        st.caption(st.session_state.get("mutation_detail", "Pregunta original"))
-
-    st.markdown(f"### {display_q}")
-
-    locked = bool(st.session_state.get("session_locked"))
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if st.button("Comenzar respuesta", disabled=locked or not display_q, width="stretch"):
-            st.session_state["question_started_at"] = time.time()
-            st.session_state["session_locked"] = True
-            st.session_state["answer_submitted"] = False
-            st.session_state["last_evaluation"] = None
-            st.rerun()
-    with c2:
-        if st.button("Cancelar", disabled=not locked, width="stretch"):
-            _reset_answer_controls()
-            st.rerun()
-    with c3:
-        if st.button("Saltar tarjeta", disabled=locked, width="stretch"):
-            _advance_study_queue()
-            st.rerun()
-
-    can_answer = locked and not st.session_state.get("answer_submitted")
-    if st.session_state.get("question_started_at") and can_answer:
-        elapsed_live = int((time.time() - st.session_state["question_started_at"]) * 1000)
-        st.caption(f"Cronómetro: {elapsed_live} ms")
-
-    help_txt = (
-        "Resultado exacto (evaluación estricta)."
-        if modo == "ejercicio"
-        else "Explica con tus palabras (evaluación semántica)."
-    )
-    answer_key = _answer_input_key(st.session_state.get("active_card_id"))
-    respuesta = st.text_area(
-        "Tu respuesta",
-        disabled=not can_answer,
-        key=answer_key,
-        help=help_txt,
-        height=140,
-    )
-
-    def _on_enviar_respuesta() -> None:
-        # Guarda el texto actual y rota la key antes del rerun (widget limpio).
-        st.session_state["_pending_study_answer"] = st.session_state.get(answer_key, "")
-        _bump_answer_form_key()
-
-    if st.button(
-        "Enviar respuesta",
-        type="primary",
-        disabled=not can_answer,
-        on_click=_on_enviar_respuesta,
-    ):
-        pending = str(st.session_state.pop("_pending_study_answer", None) or respuesta or "").strip()
-        if not pending:
-            st.warning("Escribe una respuesta antes de enviar.")
-            return
-        if not reference:
-            st.error("Esta tarjeta no tiene respuesta de referencia.")
-            return
-
-        elapsed = int((time.time() - st.session_state["question_started_at"]) * 1000)
-        with st.spinner("Evaluando comprensión..."):
-            try:
-                result = evaluate_answer(
-                    question_text=display_q,
-                    reference_text=reference,
-                    student_answer=pending,
-                    response_time_ms=elapsed,
-                    previous_repetitions=int(st.session_state.get("active_repetitions") or 0),
-                    previous_easiness=float(st.session_state.get("active_easiness") or 2.5),
-                    previous_interval_days=int(st.session_state.get("active_interval_days") or 1),
-                    modo_tarjeta=modo,
-                )
-            except Exception:
-                result = EvaluationResult(
-                    nota_ia=0.0,
-                    auditoria_estado="Error",
-                    auditoria_tiempo_ms=elapsed,
-                    intervalo_dias=1,
-                    nlp_method="fallback-error",
-                    anomaly_method="fallback-error",
-                    interval_strategy="fallback-error",
-                    quality=0,
-                    repetitions=0,
-                    easiness=2.5,
-                    key_points=[],
-                    conceptual_errors=["No se pudo procesar el análisis."],
-                    writing_suggestion="Intenta de nuevo.",
-                    feedback_method="fallback-error",
-                    modo_tarjeta=modo,
-                )
-
-        result.intervalo_dias = interval_policy.apply_study_plan(
-            interval_days=result.intervalo_dias,
-            study_plan=st.session_state.get("plan_estudio", IntervalPolicyService.PLAN_RETENCION),
-        )
-
-        saved_id = None
-        card_id = st.session_state.get("active_card_id")
-        try:
-            if not card_id:
-                raise RuntimeError("No hay tarjeta activa para guardar el repaso.")
-            saved_id = db_manager.record_study_response(
-                id_tarjeta=int(card_id),
-                usuario_id=_require_usuario_id(),
-                respuesta_estudiante=pending,
-                nota_ia=result.nota_ia,
-                auditoria_estado=result.auditoria_estado,
-                auditoria_tiempo_ms=result.auditoria_tiempo_ms,
-                intervalo_recomendado_dias=result.intervalo_dias,
-                plan_estudio=st.session_state.get("plan_estudio"),
-                repetitions_count=result.repetitions,
-                easiness_factor=result.easiness,
-            )
-        except Exception as exc:
-            st.error(f"No se pudo guardar el repaso en PostgreSQL: {exc}")
-
-        st.session_state["answer_submitted"] = True
-        st.session_state["session_locked"] = False
-        st.session_state["question_started_at"] = None
-        st.session_state["last_evaluation"] = result
-        st.session_state["last_card_id"] = saved_id
-        st.session_state["last_reference_text"] = reference
-        # Limpia mutación de esta tarjeta para el próximo ciclo.
-        cache = dict(st.session_state.get("mutation_cache") or {})
-        cache.pop(st.session_state.get("active_card_id"), None)
-        st.session_state["mutation_cache"] = cache
-        st.rerun()
-
-    result = st.session_state.get("last_evaluation")
-    if st.session_state.get("answer_submitted") and result is not None:
-        st.success("Repaso guardado.")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Nota", f"{result.nota_ia}/5")
-        m2.metric("Auditoría", result.auditoria_estado)
-        m3.metric("Próxima revisión", f"+{result.intervalo_dias} d")
-        st.caption(
-            f"NLP={result.nlp_method} | Mutada={is_mutated} | "
-            f"ID={st.session_state.get('last_card_id')}"
-        )
-        st.write("**Tutoría**")
-        for item in result.key_points:
-            st.write(f"- {item}")
-        if result.conceptual_errors:
-            st.write("**Errores**")
-            for item in result.conceptual_errors:
-                st.write(f"- {item}")
-        st.info(result.writing_suggestion)
-        with st.expander("Respuesta de referencia (original)"):
-            st.write(st.session_state.get("last_reference_text", ""))
-        if st.button("Siguiente tarjeta", type="primary"):
-            _advance_study_queue()
-            st.rerun()
-
-
-# ---------------------------------------------------------------------------
-# Pestaña 2 — Cargar material
-# ---------------------------------------------------------------------------
-def render_load_tab() -> None:
-    st.subheader("➕ Cargar material")
-    st.caption("Sube PDF o apuntes → extracción inteligente → aprueba tarjetas.")
-
-    if st.session_state.get("session_locked"):
-        st.warning("Hay una respuesta en curso en Estudiar. Cancélala antes de cargar material.")
-        return
-
-    career_hint = st.text_input(
-        "Carrera objetivo (opcional)",
-        value=st.session_state.get("career_hint", ""),
-        key="career_hint_input",
-    )
-    st.session_state["career_hint"] = career_hint
-
-    plan_estudio = st.selectbox(
-        "Plan de estudio para tarjetas nuevas",
-        options=[IntervalPolicyService.PLAN_INTENSIVO, IntervalPolicyService.PLAN_RETENCION],
-        index=0
-        if st.session_state.get("plan_estudio") == IntervalPolicyService.PLAN_INTENSIVO
-        else 1,
-        key="plan_estudio_load",
-    )
-    st.session_state["plan_estudio"] = plan_estudio
-
-    uploaded_pdf = st.file_uploader("PDF de apuntes", type=["pdf"], key="pdf_uploader")
-    manual_source = st.text_area("O pega apuntes", key="manual_source_input", height=160)
-
-    if uploaded_pdf is not None and not st.session_state.get("pdf_text"):
-        try:
-            doc = process_pdf(uploaded_pdf.read(), allow_ocr=True)
-            if doc.text:
-                st.session_state["pdf_text"] = doc.text
-                st.session_state["pdf_chunks"] = doc.chunks
-                st.session_state["pdf_method"] = doc.method
-                st.session_state["pdf_warnings"] = doc.warnings
-                st.success(
-                    f"PDF procesado ({doc.method}): {doc.page_count} págs, "
-                    f"{len(doc.chunks)} fragmentos, {doc.chars_per_page:.0f} chars/pág."
-                )
-                for warn in doc.warnings:
-                    st.caption(f"⚠️ {warn}")
-            else:
-                st.warning("PDF sin texto legible (¿escaneado sin OCR instalado?).")
-                for warn in doc.warnings:
-                    st.caption(f"⚠️ {warn}")
-        except Exception:
-            st.error("No se pudo leer el PDF.")
-
-    if st.session_state.get("pdf_text"):
-        method = st.session_state.get("pdf_method") or "?"
-        n_chunks = len(st.session_state.get("pdf_chunks") or [])
-        st.caption(
-            f"PDF en memoria: {len(st.session_state['pdf_text'])} caracteres · "
-            f"método={method} · chunks={n_chunks}"
-        )
-        if st.button("Quitar PDF"):
-            st.session_state["pdf_text"] = ""
-            st.session_state["pdf_chunks"] = []
-            st.session_state["pdf_method"] = ""
-            st.session_state["pdf_warnings"] = []
-            st.rerun()
-
-    chunks: List[str] = []
-    origins: List[str] = []
-    if st.session_state.get("pdf_text"):
-        chunks.append(st.session_state["pdf_text"])
-        origins.append("pdf")
-    if manual_source.strip():
-        chunks.append(manual_source.strip())
-        origins.append("manual")
-    merged = "\n\n".join(chunks)
-    origen = "+".join(origins) if origins else "manual"
-
-    c1, c2 = st.columns(2)
-    with c1:
-        extract_clicked = st.button(
-            "Extraer tarjetas con IA",
-            type="primary",
-            disabled=not merged.strip(),
-            width="stretch",
-        )
-    with c2:
-        if st.button("Limpiar propuesta", width="stretch"):
-            st.session_state["proposed_cards"] = []
-            st.session_state["extraction_detail"] = ""
-            st.session_state["extraction_source"] = ""
-            st.rerun()
-
-    if extract_clicked:
-        with st.spinner("Diseñador instruccional extrayendo ~10 tarjetas..."):
-            try:
-                result = extract_study_cards(merged, max_cards=10, career_hint=career_hint or None)
-                st.session_state["proposed_cards"] = result.cards
-                st.session_state["extraction_source"] = result.source
-                st.session_state["extraction_detail"] = result.detail
-            except Exception as exc:
-                st.error(f"Extracción fallida: {exc}")
-
-    if st.session_state.get("extraction_detail"):
-        src = st.session_state.get("extraction_source")
-        if src == "openrouter":
-            st.success(st.session_state["extraction_detail"])
-        else:
-            st.warning(st.session_state["extraction_detail"])
-
-    proposed: List[ExtractedCard] = list(st.session_state.get("proposed_cards") or [])
-    if proposed:
-        st.write("#### Revisión de propuesta")
-        st.dataframe(cards_to_table_rows(proposed), width="stretch")
-        if st.button("Aprobar y Generar Tarjetas", type="primary", width="stretch"):
-            try:
-                ids = _approve_proposed_cards(proposed, plan_estudio=plan_estudio, origen_contenido=origen)
-                st.session_state["proposed_cards"] = []
-                st.success(f"{len(ids)} tarjetas guardadas. Ve a 📚 Estudiar.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"No se pudieron guardar: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Pestaña 3 — Dashboard
-# ---------------------------------------------------------------------------
-def render_dashboard_tab() -> None:
-    st.subheader("📊 Dashboard")
-    try:
-        dashboard = db_manager.fetch_progress_dashboard(
-            usuario_id=_require_usuario_id(),
-            due_limit=20,
-        )
-        a, b = st.columns(2)
-        a.metric("Temas dominados", dashboard.get("temas_dominados", 0))
-        b.metric("Repasos para hoy", dashboard.get("total_repasos_hoy", 0))
-
-        due_rows = dashboard.get("repasos_hoy", [])
-        if due_rows:
-            st.write("**Vencidas hoy**")
-            safe = [{k: r.get(k) for k in DUE_COLUMNS if k in r} for r in due_rows]
-            st.dataframe(safe, width="stretch")
-        else:
-            st.success("Sin repasos vencidos.")
-
-        by_plan = dashboard.get("por_plan", [])
-        if by_plan:
-            st.write("**Por plan**")
-            st.dataframe(by_plan, width="stretch")
-    except Exception:
-        st.warning("No se pudo cargar el dashboard.")
-
-    st.write("---")
-    st.write("**Historial reciente**")
-    try:
-        cards = db_manager.fetch_memory_cards(usuario_id=_require_usuario_id(), limit=25)
-        if cards:
-            safe = [{k: c.get(k) for k in STUDENT_HISTORY_COLUMNS if k in c} for c in cards]
-            st.dataframe(safe, width="stretch")
-        else:
-            st.info("Aún no hay tarjetas.")
-    except Exception:
-        st.warning("No se pudo leer el historial.")
-
 
 def build_ui() -> None:
     st.set_page_config(
@@ -791,29 +212,38 @@ def build_ui() -> None:
             _logout()
             st.rerun()
 
-    tab_ingesta, tab_simulacro, tab_practica = st.tabs(
+    tab_guias, tab_practica, tab_simulacro, tab_ingesta, tab_dashboard = st.tabs(
         [
-            "📥 Ingesta de Material (Admin)",
-            "📝 Simulacro Oficial UNA (120 min)",
+            "📚 Mis Guías",
             "🎯 Práctica Enfocada",
+            "📝 Simulacro Oficial UNA (120 min)",
+            "📥 Banco Oficial (Admin)",
+            "📊 Mi rendimiento",
         ]
     )
-    with tab_ingesta:
-        render_ingesta_admin_tab()
-    with tab_simulacro:
-        render_simulacro_oficial_tab()
+    with tab_guias:
+        render_student_ingestion_tab(usuario_id=_effective_usuario_id())
     with tab_practica:
         render_practica_enfocada_tab()
+    with tab_simulacro:
+        render_simulacro_oficial_tab()
+    with tab_ingesta:
+        render_ingesta_admin_tab()
+    with tab_dashboard:
+        render_student_dashboard_tab(
+            usuario_id=_effective_usuario_id(),
+            nombre_alumno=str(user.get("nombre") or ""),
+        )
 
 
 # ---------------------------------------------------------------------------
 # Producción UNA — Pestaña 1: Ingesta Admin
 # ---------------------------------------------------------------------------
 def render_ingesta_admin_tab() -> None:
-    st.subheader("📥 Ingesta de Material (Admin)")
+    st.subheader("📥 Banco Oficial (Admin)")
     st.caption(
-        "PDF → aduana de limpieza → OpenRouter (MCQ A–E) → "
-        "`temas_estudio` + `banco_preguntas`."
+        "PDF → aduana → OpenRouter (MCQ A–E) → bóveda **oficial** "
+        "(`propietario_usuario_id` NULL). Visible para todos los alumnos."
     )
 
     try:
@@ -861,16 +291,26 @@ def render_ingesta_admin_tab() -> None:
             return
         try:
             with st.spinner("Aduana PDF (extracción / OCR / limpieza / chunks)..."):
-                doc = process_pdf(uploaded.getvalue(), allow_ocr=True)
+                doc = process_pdf(
+                    uploaded.getvalue(),
+                    allow_ocr=True,
+                    source_filename=getattr(uploaded, "name", None),
+                )
             if not doc.text or not doc.chunks:
                 st.error("PDF sin texto usable. ¿Escaneado sin OCR disponible?")
                 for w in doc.warnings:
                     st.caption(f"⚠️ {w}")
                 return
 
+            nombre_archivo = (
+                (doc.meta or {}).get("nombre_archivo_fuente")
+                or getattr(uploaded, "name", None)
+                or "desconocido.pdf"
+            )
             st.info(
-                f"PDF OK · método=`{doc.method}` · {doc.page_count} págs · "
-                f"{len(doc.chunks)} chunks · {doc.chars_per_page:.0f} chars/pág"
+                f"PDF OK · archivo=`{nombre_archivo}` · método=`{doc.method}` · "
+                f"{doc.page_count} págs · {len(doc.chunks)} chunks · "
+                f"{doc.chars_per_page:.0f} chars/pág"
             )
             for w in doc.warnings:
                 st.caption(f"⚠️ {w}")
@@ -879,15 +319,19 @@ def render_ingesta_admin_tab() -> None:
                 result = extract_banco_preguntas_from_chunks(
                     doc.chunks,
                     materia_id=int(materia_id),
+                    auto_clasificar=False,
                     max_items_per_chunk=int(max_items),
                     origen_contenido="pdf",
                     fuente="openrouter",
+                    nombre_archivo_fuente=str(nombre_archivo),
+                    propietario_usuario_id=None,
                     persist=True,
                 )
             st.session_state["ingesta_last_result"] = result.to_dict()
             pers = result.persistencia or {}
             st.success(
                 f"Bóveda actualizada · materia **{result.materia_nombre}** · "
+                f"archivo=`{pers.get('nombre_archivo_fuente') or nombre_archivo}` · "
                 f"validados={result.items_validados} · "
                 f"insertadas={pers.get('n_insertadas', 0)} · "
                 f"duplicadas={pers.get('n_duplicadas', 0)} · "
@@ -909,23 +353,367 @@ def render_ingesta_admin_tab() -> None:
 # ---------------------------------------------------------------------------
 # Producción UNA — Pestaña 2: Simulacro Oficial
 # ---------------------------------------------------------------------------
+def _accumulate_mcq_time(
+    *,
+    tiempos_key: str,
+    timer_qid_key: str,
+    timer_started_key: str,
+) -> None:
+    """Suma el tiempo transcurrido de la pregunta activa al dict de tiempos (ms)."""
+    started = st.session_state.get(timer_started_key)
+    qid = st.session_state.get(timer_qid_key)
+    if started is None or qid is None:
+        return
+    elapsed_ms = max(0, int((time.time() - float(started)) * 1000))
+    tiempos: Dict[str, int] = dict(st.session_state.get(tiempos_key) or {})
+    tiempos[str(qid)] = int(tiempos.get(str(qid), 0)) + elapsed_ms
+    st.session_state[tiempos_key] = tiempos
+    st.session_state[timer_started_key] = None
+
+
+def _ensure_mcq_question_timer(
+    *,
+    pregunta_id: str,
+    tiempos_key: str,
+    timer_qid_key: str,
+    timer_started_key: str,
+) -> None:
+    """Al cambiar de ítem, acumula el anterior y arranca cronómetro del actual."""
+    current = str(pregunta_id)
+    if st.session_state.get(timer_qid_key) != current:
+        _accumulate_mcq_time(
+            tiempos_key=tiempos_key,
+            timer_qid_key=timer_qid_key,
+            timer_started_key=timer_started_key,
+        )
+        st.session_state[timer_qid_key] = current
+        st.session_state[timer_started_key] = time.time()
+
+
+def _render_cierre_resultado(resultado: ResultadoCierreBloque) -> None:
+    """Resumen post-finalización (ledger ya persistido)."""
+    st.success(
+        f"Guardado en `historial_intentos` · {resultado.n_insertados} intentos · "
+        f"correctas={resultado.correctas} · incorrectas={resultado.incorrectas} · "
+        f"en blanco={resultado.en_blanco}"
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Puntaje bruto", f"{resultado.puntaje_bruto:.0f}")
+    c2.metric("Puntaje ponderado", f"{resultado.puntaje_ponderado:.3f}")
+    c3.metric("Tiempo total", f"{resultado.tiempo_total_ms / 1000:.1f} s")
+    if resultado.id_sesion:
+        st.caption(f"Sesión simulacro `{resultado.id_sesion}` marcada como **finalizada**.")
+    with st.expander("Detalle por pregunta"):
+        st.dataframe(resultado.detalle_por_pregunta, width="stretch")
+
+
+def _clear_socratic_chats(*, modo_origen: Optional[str] = None) -> None:
+    """Limpia historiales de chat (todo o solo un modo)."""
+    chats: Dict[str, Any] = dict(st.session_state.get("socratic_chats") or {})
+    if modo_origen is None:
+        st.session_state["socratic_chats"] = {}
+        return
+    prefix = f"{modo_origen}:"
+    st.session_state["socratic_chats"] = {
+        k: v for k, v in chats.items() if not str(k).startswith(prefix)
+    }
+
+
+def _socratic_chat_storage_key(modo_origen: str, pregunta_id: int) -> str:
+    return f"{modo_origen}:{int(pregunta_id)}"
+
+
+def _resolve_justificacion_banco(pregunta_id: int) -> Optional[str]:
+    """Lee justificación del banco con caché de sesión (no expone la clave)."""
+    cache: Dict[str, Any] = dict(st.session_state.get("socratic_justificacion_cache") or {})
+    key = str(int(pregunta_id))
+    if key in cache:
+        val = cache[key]
+        return str(val) if val else None
+    try:
+        just = banco_repository.fetch_justificacion(int(pregunta_id))
+    except Exception:
+        just = None
+    cache[key] = just or ""
+    st.session_state["socratic_justificacion_cache"] = cache
+    return just
+
+
+def _build_tutor_context_server_side(
+    *,
+    pregunta: Any,
+    answers: Dict[str, str],
+    modo_origen: str,
+    sesion_id: Optional[int],
+) -> TutorContext:
+    """
+    Arma TutorContext en servidor.
+
+    La alternativa_correcta sale del objeto PreguntaTutor en memoria
+    (sesión Streamlit del proceso), NUNCA de un widget/público del cliente.
+    """
+    qid = int(getattr(pregunta, "id_pregunta"))
+    alts = getattr(pregunta, "alternativas", {}) or {}
+    if not isinstance(alts, dict):
+        alts = {}
+    correcta = str(getattr(pregunta, "alternativa_correcta", "") or "").strip().upper()
+    marcada = answers.get(str(qid)) or answers.get(qid)  # type: ignore[index]
+    materia = str(getattr(pregunta, "materia_nombre", "") or "").strip()
+    tema = str(getattr(pregunta, "tema_nombre", "") or "").strip()
+    tema_o_materia = " · ".join(p for p in (materia, tema) if p) or "Sin tema"
+
+    try:
+        uid = _effective_usuario_id()
+    except Exception:
+        uid = None
+
+    return TutorContext(
+        pregunta_id=qid,
+        enunciado_pregunta=str(getattr(pregunta, "enunciado", "") or ""),
+        alternativas={str(k).upper(): str(v) for k, v in alts.items()},
+        alternativa_correcta=correcta,
+        tema_o_materia=tema_o_materia,
+        sesion_id=int(sesion_id) if sesion_id is not None else None,
+        alternativa_marcada_por_alumno=str(marcada).upper() if marcada else None,
+        justificacion_banco=_resolve_justificacion_banco(qid),
+        modo_origen=modo_origen,
+        usuario_id=int(uid) if uid is not None else None,
+    )
+
+
+def _render_socratic_tutor_panel(
+    *,
+    pregunta: Any,
+    answers_key: str,
+    modo_origen: str,
+    sesion_id: Optional[int] = None,
+    panel_title: str = "💬 Tengo una duda (tutor socrático)",
+    expanded: bool = False,
+) -> None:
+    """
+    Chat opt-in encapsulado por pregunta_id.
+
+    No muta respuestas MCQ ni tiempos; no escribe en historial_intentos.
+    """
+    qid = int(getattr(pregunta, "id_pregunta"))
+    storage_key = _socratic_chat_storage_key(modo_origen, qid)
+    chats: Dict[str, List[Dict[str, str]]] = dict(
+        st.session_state.get("socratic_chats") or {}
+    )
+    historial: List[Dict[str, str]] = list(chats.get(storage_key) or [])
+    open_panel = bool(expanded) or bool(historial)
+
+    with st.expander(panel_title, expanded=open_panel):
+        st.caption(
+            "El tutor guía sin revelar la letra correcta. "
+            "Abrir el chat **no** cambia tu marca ni el puntaje."
+        )
+        for turn in historial:
+            role = turn.get("role") or "assistant"
+            if role not in {"user", "assistant"}:
+                role = "assistant"
+            with st.chat_message(role):
+                st.markdown(turn.get("content") or "")
+
+        # text_input + botón (chat_input no es fiable dentro de expanders)
+        draft_n_key = f"socratic_draft_n::{storage_key}"
+        draft_n = int(st.session_state.get(draft_n_key) or 0)
+        input_key = f"socratic_draft::{storage_key}::{draft_n}"
+        col_in, col_btn = st.columns([4, 1])
+        with col_in:
+            draft = st.text_input(
+                "Tu duda",
+                key=input_key,
+                placeholder="Ej. ¿Por qué mi opción no encaja con el enunciado?",
+                label_visibility="collapsed",
+            )
+        with col_btn:
+            enviar = st.button(
+                "Enviar",
+                type="primary",
+                width="stretch",
+                key=f"socratic_send::{storage_key}",
+            )
+
+        if not enviar:
+            return
+
+        mensaje = str(draft or "").strip()
+        if not mensaje:
+            st.warning("Escribe una duda antes de enviar.")
+            return
+
+        answers: Dict[str, str] = dict(st.session_state.get(answers_key) or {})
+        # Preserva respuestas antes de cualquier trabajo de red.
+        st.session_state[answers_key] = answers
+
+        historial.append({"role": "user", "content": mensaje})
+        chats[storage_key] = historial
+        st.session_state["socratic_chats"] = chats
+        # Nueva key de input en el próximo rerun (no mutar widget ya montado)
+        st.session_state[draft_n_key] = draft_n + 1
+
+        try:
+            contexto = _build_tutor_context_server_side(
+                pregunta=pregunta,
+                answers=answers,
+                modo_origen=modo_origen,
+                sesion_id=sesion_id,
+            )
+            with st.spinner("Tutor pensando (socrático)…"):
+                reply = socratic_tutor_service.generar_respuesta_socratica(
+                    contexto,
+                    mensaje,
+                    historial_chat=historial[:-1],
+                )
+            assistant_text = reply.texto
+            if reply.spoilers_bloqueados:
+                assistant_text += (
+                    "\n\n_*(respuesta filtrada: el modelo intentó revelar la clave)*_"
+                )
+        except Exception as exc:
+            assistant_text = (
+                "No pude consultar al tutor en este momento. "
+                f"Intenta de nuevo. ({type(exc).__name__})"
+            )
+
+        historial.append({"role": "assistant", "content": assistant_text})
+        chats[storage_key] = historial
+        st.session_state["socratic_chats"] = chats
+        st.session_state[answers_key] = answers
+        st.rerun()
+
+
+def _render_mcq_review_with_tutor(
+    *,
+    preguntas: List[Any],
+    index_key: str,
+    answers_key: str,
+    modo_origen: str,
+    sesion_id: Optional[int] = None,
+) -> None:
+    """Navegación post-cierre: revisa ítems + tutor socrático opt-in."""
+    total = len(preguntas)
+    if total == 0:
+        return
+
+    review_index_key = f"{index_key}__review"
+    idx = int(st.session_state.get(review_index_key) or 0)
+    idx = max(0, min(idx, total - 1))
+    st.session_state[review_index_key] = idx
+
+    answers: Dict[str, str] = dict(st.session_state.get(answers_key) or {})
+    q = preguntas[idx]
+    orden = getattr(q, "orden", idx + 1)
+    materia = getattr(q, "materia_nombre", "")
+    tema = getattr(q, "tema_nombre", "")
+    enunciado = getattr(q, "enunciado", "")
+    alts = getattr(q, "alternativas", {}) or {}
+    if not isinstance(alts, dict):
+        alts = {}
+    qid = str(getattr(q, "id_pregunta", orden))
+    marcada = answers.get(qid)
+
+    st.subheader("🔍 Revisión con tutor")
+    st.caption(
+        "Modo revisión post-evaluación. Puedes pedir ayuda socrática por ítem. "
+        "La clave correcta no se muestra aquí; solo la usa el tutor en servidor."
+    )
+    st.progress((idx + 1) / total, text=f"Revisión: {idx + 1} / {total}")
+    st.markdown(f"**#{orden}** · {materia} · _{tema}_")
+    st.markdown(f"### {enunciado}")
+
+    for k in ("A", "B", "C", "D", "E"):
+        if k not in alts:
+            continue
+        marker = " ← tu marca" if marcada == k else ""
+        st.markdown(f"- **{k})** {alts[k]}{marker}")
+
+    if marcada:
+        st.info(f"Tu respuesta registrada: **{marcada}**")
+    else:
+        st.warning("Este ítem quedó **en blanco**.")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button(
+            "← Anterior",
+            disabled=idx <= 0,
+            width="stretch",
+            key=f"review_prev_{answers_key}",
+        ):
+            st.session_state[review_index_key] = idx - 1
+            st.rerun()
+    with c2:
+        st.caption(f"Ítem {idx + 1} de {total}")
+    with c3:
+        if st.button(
+            "Siguiente →",
+            disabled=idx >= total - 1,
+            width="stretch",
+            key=f"review_next_{answers_key}",
+        ):
+            st.session_state[review_index_key] = idx + 1
+            st.rerun()
+
+    _render_socratic_tutor_panel(
+        pregunta=q,
+        answers_key=answers_key,
+        modo_origen=modo_origen,
+        sesion_id=sesion_id,
+    )
+
+
 def _render_mcq_navigator(
     *,
     preguntas: List[Any],
     index_key: str,
     answers_key: str,
+    tiempos_key: str,
     titulo_progreso: str,
+    finalize_label: str = "Finalizar y Evaluar",
+    on_finalize: Any = None,
+    cerrado_key: Optional[str] = None,
+    resultado_key: Optional[str] = None,
+    modo_origen: str = "practica",
+    sesion_id: Optional[int] = None,
+    tutor_en_vivo: bool = False,
+    feedback_inmediato: bool = False,
 ) -> None:
-    """Render genérico de ítems A–E con navegación."""
+    """Render genérico de ítems A–E con navegación, timer y cierre de ciclo."""
     total = len(preguntas)
     if total == 0:
         st.warning("No hay preguntas para mostrar.")
+        return
+
+    if cerrado_key and st.session_state.get(cerrado_key):
+        resultado = st.session_state.get(resultado_key) if resultado_key else None
+        if isinstance(resultado, ResultadoCierreBloque):
+            _render_cierre_resultado(resultado)
+        else:
+            st.info("Este bloque ya fue finalizado y guardado.")
+        st.divider()
+        _render_mcq_review_with_tutor(
+            preguntas=preguntas,
+            index_key=index_key,
+            answers_key=answers_key,
+            modo_origen=modo_origen,
+            sesion_id=sesion_id,
+        )
         return
 
     idx = int(st.session_state.get(index_key) or 0)
     idx = max(0, min(idx, total - 1))
     st.session_state[index_key] = idx
     answers: Dict[str, str] = dict(st.session_state.get(answers_key) or {})
+
+    checked_key = f"{answers_key}__comprobadas"
+    check_ok_key = f"{answers_key}__check_ok"
+    comprobadas: Dict[str, bool] = dict(st.session_state.get(checked_key) or {})
+    check_ok: Dict[str, bool] = dict(st.session_state.get(check_ok_key) or {})
+
+    timer_qid_key = f"{answers_key}__timer_qid"
+    timer_started_key = f"{answers_key}__timer_started"
 
     st.progress((idx + 1) / total, text=f"{titulo_progreso}: {idx + 1} / {total}")
     q = preguntas[idx]
@@ -937,23 +725,79 @@ def _render_mcq_navigator(
     if not isinstance(alts, dict):
         alts = {}
 
+    qid = str(getattr(q, "id_pregunta", orden))
+    _ensure_mcq_question_timer(
+        pregunta_id=qid,
+        tiempos_key=tiempos_key,
+        timer_qid_key=timer_qid_key,
+        timer_started_key=timer_started_key,
+    )
+
+    tiempos_now: Dict[str, int] = dict(st.session_state.get(tiempos_key) or {})
+    started = st.session_state.get(timer_started_key)
+    live_ms = int(tiempos_now.get(qid, 0))
+    if started is not None:
+        live_ms += max(0, int((time.time() - float(started)) * 1000))
+    st.caption(f"⏱ Tiempo en esta pregunta: **{live_ms / 1000:.1f} s**")
+
     st.markdown(f"**#{orden}** · {materia} · _{tema}_")
     st.markdown(f"### {enunciado}")
 
     opciones = [k for k in ("A", "B", "C", "D", "E") if k in alts]
-    qid = str(getattr(q, "id_pregunta", orden))
     current = answers.get(qid)
     default_i = opciones.index(current) if current in opciones else 0
+    ya_comprobada = bool(feedback_inmediato and comprobadas.get(qid))
 
-    choice = st.radio(
-        "Tu respuesta",
-        options=opciones,
-        format_func=lambda k: f"{k}) {alts.get(k, '')}",
-        index=default_i if opciones else 0,
-        key=f"mcq_radio_{answers_key}_{qid}_{idx}",
-    )
-    answers[qid] = choice
-    st.session_state[answers_key] = answers
+    radio_kwargs: Dict[str, Any] = {
+        "options": opciones,
+        "format_func": lambda k: f"{k}) {alts.get(k, '')}",
+        "index": default_i if opciones else 0,
+        "key": f"mcq_radio_{answers_key}_{qid}_{idx}",
+    }
+    if feedback_inmediato:
+        radio_kwargs["disabled"] = ya_comprobada
+
+    choice = st.radio("Tu respuesta", **radio_kwargs)
+    if not ya_comprobada:
+        answers[qid] = choice
+        st.session_state[answers_key] = answers
+    else:
+        # Mantén la marca congelada al comprobar
+        choice = answers.get(qid) or choice
+        st.session_state[answers_key] = answers
+
+    fallo_actual = False
+    if feedback_inmediato:
+        if not ya_comprobada:
+            if st.button(
+                "Comprobar Respuesta",
+                type="primary",
+                width="stretch",
+                key=f"btn_check_{answers_key}_{qid}",
+            ):
+                marcada = str(answers.get(qid) or choice or "").strip().upper()
+                correcta = str(getattr(q, "alternativa_correcta", "") or "").strip().upper()
+                es_ok = bool(marcada) and marcada == correcta
+                comprobadas[qid] = True
+                check_ok[qid] = es_ok
+                st.session_state[checked_key] = comprobadas
+                st.session_state[check_ok_key] = check_ok
+                st.session_state[answers_key] = answers
+                st.rerun()
+        else:
+            es_ok = bool(check_ok.get(qid))
+            fallo_actual = not es_ok
+            if es_ok:
+                st.success("¡Correcto!")
+            else:
+                st.error(
+                    "Respuesta incorrecta. ¡Usa el tutor socrático para entender por qué!"
+                )
+                st.info(
+                    "👇 Abre el tutor abajo: te guía con preguntas, **sin** revelar la letra."
+                )
+
+    puede_avanzar = (not feedback_inmediato) or ya_comprobada
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -962,10 +806,76 @@ def _render_mcq_navigator(
             st.rerun()
     with c2:
         st.caption(f"Marcadas: {len(answers)} / {total}")
+        if feedback_inmediato and not ya_comprobada:
+            st.caption("Comprueba tu respuesta para continuar →")
     with c3:
-        if st.button("Siguiente →", disabled=idx >= total - 1, width="stretch", type="primary"):
+        if st.button(
+            "Siguiente →",
+            disabled=(idx >= total - 1) or (not puede_avanzar),
+            width="stretch",
+            type="primary" if idx < total - 1 else "secondary",
+            key=f"btn_next_{answers_key}_{idx}",
+        ):
             st.session_state[index_key] = idx + 1
             st.rerun()
+
+    if tutor_en_vivo:
+        if feedback_inmediato and not ya_comprobada:
+            st.caption("Tutor socrático disponible **después** de comprobar tu respuesta.")
+        else:
+            _render_socratic_tutor_panel(
+                pregunta=q,
+                answers_key=answers_key,
+                modo_origen=modo_origen,
+                sesion_id=sesion_id,
+                expanded=fallo_actual,
+                panel_title=(
+                    "💬 Tutor socrático — ¡úsalo para entender el error!"
+                    if fallo_actual
+                    else "💬 Tengo una duda (tutor socrático)"
+                ),
+            )
+    else:
+        st.caption(
+            "Tutor socrático disponible en **revisión** al finalizar el bloque "
+            "(integridad del cronómetro)."
+        )
+
+    # Cierre del ciclo solo en la última pregunta
+    if idx >= total - 1 and callable(on_finalize):
+        st.divider()
+        pendientes = total - len(answers)
+        if pendientes > 0:
+            st.warning(
+                f"Hay {pendientes} pregunta(s) sin marcar. "
+                "Se registrarán como **en blanco** (+2 pts base UNA)."
+            )
+        puede_finalizar = (not feedback_inmediato) or ya_comprobada
+        if st.button(
+            finalize_label,
+            type="primary",
+            width="stretch",
+            key=f"btn_fin_{answers_key}",
+            disabled=not puede_finalizar,
+        ):
+            _accumulate_mcq_time(
+                tiempos_key=tiempos_key,
+                timer_qid_key=timer_qid_key,
+                timer_started_key=timer_started_key,
+            )
+            try:
+                with st.spinner("Evaluando y guardando en el ledger..."):
+                    resultado = on_finalize(
+                        dict(st.session_state.get(answers_key) or {}),
+                        dict(st.session_state.get(tiempos_key) or {}),
+                    )
+                if cerrado_key:
+                    st.session_state[cerrado_key] = True
+                if resultado_key:
+                    st.session_state[resultado_key] = resultado
+                st.rerun()
+            except Exception as exc:
+                st.error(f"No se pudo finalizar: {exc}")
 
 
 def render_simulacro_oficial_tab() -> None:
@@ -978,6 +888,19 @@ def render_simulacro_oficial_tab() -> None:
     uid = _effective_usuario_id()
     st.caption(f"usuario_id efectivo: `{uid}`")
 
+    fuente_labels = {
+        "todo": "Todo (oficial + mis guías)",
+        "oficial": "Solo Banco Oficial",
+        "mis_guias": "Solo Mis Guías",
+    }
+    fuente_banco = st.radio(
+        "Fuente de preguntas",
+        options=list(fuente_labels.keys()),
+        format_func=lambda k: fuente_labels[k],
+        horizontal=True,
+        key="simulacro_fuente_banco",
+    )
+
     col_a, col_b = st.columns([2, 1])
     with col_a:
         start = st.button("Iniciar Simulacro Oficial", type="primary", width="stretch")
@@ -986,6 +909,11 @@ def render_simulacro_oficial_tab() -> None:
             st.session_state["simulacro_activo"] = None
             st.session_state["simulacro_index"] = 0
             st.session_state["simulacro_respuestas"] = {}
+            st.session_state["simulacro_tiempos_ms"] = {}
+            st.session_state["simulacro_resultado"] = None
+            st.session_state["simulacro_cerrado"] = False
+            st.session_state["simulacro_index__review"] = 0
+            _clear_socratic_chats(modo_origen="simulacro")
             st.rerun()
 
     if start:
@@ -994,10 +922,16 @@ def render_simulacro_oficial_tab() -> None:
                 examen = tutor_engine.generar_simulacro_oficial(
                     usuario_id=uid,
                     persistir_sesion=True,
+                    fuente_banco=str(fuente_banco),
                 )
             st.session_state["simulacro_activo"] = examen
             st.session_state["simulacro_index"] = 0
             st.session_state["simulacro_respuestas"] = {}
+            st.session_state["simulacro_tiempos_ms"] = {}
+            st.session_state["simulacro_resultado"] = None
+            st.session_state["simulacro_cerrado"] = False
+            st.session_state["simulacro_index__review"] = 0
+            _clear_socratic_chats(modo_origen="simulacro")
             st.success(
                 f"Simulacro listo · sesión `{examen.id_sesion}` · "
                 f"techo ponderado {examen.puntaje_maximo_ponderado} · "
@@ -1017,22 +951,64 @@ def render_simulacro_oficial_tab() -> None:
     with st.expander("Composición por materia (prospecto)"):
         st.dataframe(examen.composicion_por_materia, width="stretch")
 
+    def _on_finalize_simulacro(respuestas: Dict[str, str], tiempos: Dict[str, int]):
+        return tutor_engine.finalizar_simulacro_oficial(
+            simulacro=examen,
+            respuestas=respuestas,
+            tiempos_ms=tiempos,
+        )
+
     _render_mcq_navigator(
         preguntas=list(examen.preguntas),
         index_key="simulacro_index",
         answers_key="simulacro_respuestas",
+        tiempos_key="simulacro_tiempos_ms",
         titulo_progreso="Simulacro",
+        finalize_label="Finalizar y Evaluar simulacro",
+        on_finalize=_on_finalize_simulacro,
+        cerrado_key="simulacro_cerrado",
+        resultado_key="simulacro_resultado",
+        modo_origen="simulacro",
+        sesion_id=int(examen.id_sesion) if getattr(examen, "id_sesion", None) else None,
+        tutor_en_vivo=False,
     )
 
 
 # ---------------------------------------------------------------------------
 # Producción UNA — Pestaña 3: Práctica Enfocada
 # ---------------------------------------------------------------------------
+def _reset_practica_session_state() -> None:
+    st.session_state["practica_activa"] = None
+    st.session_state["practica_index"] = 0
+    st.session_state["practica_respuestas"] = {}
+    st.session_state["practica_tiempos_ms"] = {}
+    st.session_state["practica_resultado"] = None
+    st.session_state["practica_cerrada"] = False
+    st.session_state["practica_index__review"] = 0
+    st.session_state["practica_respuestas__comprobadas"] = {}
+    st.session_state["practica_respuestas__check_ok"] = {}
+    _clear_socratic_chats(modo_origen="practica")
+
+
+def _activate_practica_bloque(bloque: Any) -> None:
+    st.session_state["practica_activa"] = bloque
+    st.session_state["practica_index"] = 0
+    st.session_state["practica_respuestas"] = {}
+    st.session_state["practica_tiempos_ms"] = {}
+    st.session_state["practica_resultado"] = None
+    st.session_state["practica_cerrada"] = False
+    st.session_state["practica_index__review"] = 0
+    st.session_state["practica_respuestas__comprobadas"] = {}
+    st.session_state["practica_respuestas__check_ok"] = {}
+    _clear_socratic_chats(modo_origen="practica")
+
+
 def render_practica_enfocada_tab() -> None:
     st.subheader("🎯 Práctica Enfocada")
     st.caption(
         "Bloque libre (SRS + tasa de error) sin cupos del prospecto. "
-        "Los intentos futuros van a `historial_intentos` con `sesion_id = NULL`."
+        "Al finalizar, los intentos van a `historial_intentos` con `sesion_id = NULL`. "
+        "Feedback inmediato: comprueba cada respuesta antes de avanzar."
     )
 
     uid = _effective_usuario_id()
@@ -1045,6 +1021,53 @@ def render_practica_enfocada_tab() -> None:
     if not materias:
         st.warning("Catálogo vacío. Siembra Tabla 4 Biomédicas primero.")
         return
+
+    fuente_labels = {
+        "todo": "Todo (oficial + mis guías)",
+        "oficial": "Solo Banco Oficial",
+        "mis_guias": "Solo Mis Guías",
+    }
+    fuente_banco = st.radio(
+        "Fuente de preguntas",
+        options=list(fuente_labels.keys()),
+        format_func=lambda k: fuente_labels[k],
+        horizontal=True,
+        key="practica_fuente_banco",
+    )
+
+    st.markdown("#### Práctica inteligente")
+    st.caption(
+        "Salta los selectores: arma 10–15 preguntas mezclando tus temas con peor precisión."
+    )
+    if st.button(
+        "🧠 Generar Práctica de mis Debilidades",
+        type="primary",
+        width="stretch",
+        key="practica_btn_debilidades",
+    ):
+        try:
+            with st.spinner("Consultando tu historial y armando práctica inteligente..."):
+                bloque = tutor_engine.generar_practica_debilidades(
+                    usuario_id=uid,
+                    limite=12,
+                    top_temas=5,
+                    min_intentos=2,
+                    fuente_banco=str(fuente_banco),
+                )
+            _activate_practica_bloque(bloque)
+            temas_n = (bloque.resumen_prioridad or {}).get("temas_debiles", "?")
+            st.success(
+                f"Práctica de debilidades lista · {bloque.total_preguntas} ítems "
+                f"desde {temas_n} tema(s) débiles · prioridad={bloque.resumen_prioridad}"
+            )
+            st.rerun()
+        except (BancoInsuficienteError, ValueError) as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            st.error(f"No se pudo generar la práctica inteligente: {exc}")
+
+    st.divider()
+    st.markdown("#### O elige materia / tema manualmente")
 
     labels = {
         int(m["id_materia"]): f"{int(m['codigo']):02d} · {m['nombre']}" for m in materias
@@ -1075,12 +1098,10 @@ def render_practica_enfocada_tab() -> None:
 
     c1, c2 = st.columns(2)
     with c1:
-        generar = st.button("Generar Práctica", type="primary", width="stretch")
+        generar = st.button("Generar Práctica", type="secondary", width="stretch")
     with c2:
         if st.button("Limpiar práctica", width="stretch"):
-            st.session_state["practica_activa"] = None
-            st.session_state["practica_index"] = 0
-            st.session_state["practica_respuestas"] = {}
+            _reset_practica_session_state()
             st.rerun()
 
     if generar:
@@ -1091,10 +1112,9 @@ def render_practica_enfocada_tab() -> None:
                     materia_id=int(materia_id),
                     tema_id=int(tema_id) if tema_id is not None else None,
                     limite=int(limite),
+                    fuente_banco=str(fuente_banco),
                 )
-            st.session_state["practica_activa"] = bloque
-            st.session_state["practica_index"] = 0
-            st.session_state["practica_respuestas"] = {}
+            _activate_practica_bloque(bloque)
             st.success(
                 f"Práctica lista · {bloque.total_preguntas} ítems · "
                 f"prioridad={bloque.resumen_prioridad}"
@@ -1107,15 +1127,35 @@ def render_practica_enfocada_tab() -> None:
 
     bloque = st.session_state.get("practica_activa")
     if not bloque:
-        st.info("Elige materia/tema y pulsa **Generar Práctica**.")
+        st.info(
+            "Pulsa **🧠 Generar Práctica de mis Debilidades** o elige materia/tema "
+            "y **Generar Práctica**."
+        )
         return
 
     st.caption(f"Resumen de prioridad: {bloque.resumen_prioridad}")
+
+    def _on_finalize_practica(respuestas: Dict[str, str], tiempos: Dict[str, int]):
+        return tutor_engine.finalizar_practica_enfocada(
+            practica=bloque,
+            respuestas=respuestas,
+            tiempos_ms=tiempos,
+        )
+
     _render_mcq_navigator(
         preguntas=list(bloque.preguntas),
         index_key="practica_index",
         answers_key="practica_respuestas",
+        tiempos_key="practica_tiempos_ms",
         titulo_progreso="Práctica",
+        finalize_label="Finalizar y Evaluar práctica",
+        on_finalize=_on_finalize_practica,
+        cerrado_key="practica_cerrada",
+        resultado_key="practica_resultado",
+        modo_origen="practica",
+        sesion_id=None,
+        tutor_en_vivo=True,
+        feedback_inmediato=True,
     )
 
 

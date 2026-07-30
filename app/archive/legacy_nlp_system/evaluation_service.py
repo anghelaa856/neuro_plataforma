@@ -6,9 +6,9 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional
 
-from app.ml.anomaly_service import TimeAnomalyService
-from app.ml.interval_policy import IntervalPolicyService
-from app.ml.nlp_service import NlpScoreResult, SemanticNLPService
+from app.archive.legacy_nlp_system.anomaly_service import TimeAnomalyService
+from app.archive.legacy_nlp_system.interval_policy import IntervalPolicyService
+from app.archive.legacy_nlp_system.nlp_service import NlpScoreResult, SemanticNLPService
 
 
 @dataclass

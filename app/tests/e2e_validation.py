@@ -4,11 +4,11 @@ from dataclasses import asdict
 
 import requests
 
+from app.archive.legacy_nlp_system.anomaly_service import TimeAnomalyService
+from app.archive.legacy_nlp_system.interval_policy import IntervalPolicyService
+from app.archive.legacy_nlp_system.nlp_service import SemanticNLPService
+from app.archive.legacy_nlp_system.evaluation_service import evaluate_answer
 from app.database.db_manager import db_manager
-from app.ml.anomaly_service import TimeAnomalyService
-from app.ml.interval_policy import IntervalPolicyService
-from app.ml.nlp_service import SemanticNLPService
-from app.services.evaluation_service import evaluate_answer
 
 
 def assert_true(condition: bool, message: str) -> None:

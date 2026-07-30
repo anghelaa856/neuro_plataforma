@@ -21,6 +21,15 @@ ADMISSION_TABLES = (
     "historial_intentos",
 )
 
+# Migraciones idempotentes Fase 7/8. Se inyectan justo después de CREATE TABLE
+# banco_preguntas para que índices/FK/COMMENT no fallen en DBs ya existentes.
+_BANCO_COLUMN_MIGRATIONS: tuple[str, ...] = (
+    "ALTER TABLE banco_preguntas "
+    "ADD COLUMN IF NOT EXISTS nombre_archivo_fuente VARCHAR(255)",
+    "ALTER TABLE banco_preguntas "
+    "ADD COLUMN IF NOT EXISTS propietario_usuario_id BIGINT",
+)
+
 
 def _strip_sql_comments(sql: str) -> str:
     """Elimina comentarios de línea (-- ...) respetando strings simples."""
@@ -136,6 +145,51 @@ def load_admission_ddl() -> str:
     return DDL_FILE.read_text(encoding="utf-8")
 
 
+def _is_create_banco_preguntas(stmt: str) -> bool:
+    return bool(
+        re.search(
+            r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+banco_preguntas\b",
+            stmt,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _is_banco_column_migration(stmt: str) -> bool:
+    """Detecta ALTER ya presentes en el SQL para no duplicarlos al inyectar."""
+    s = " ".join(stmt.split()).lower()
+    return (
+        s.startswith("alter table banco_preguntas")
+        and "add column if not exists" in s
+        and (
+            "nombre_archivo_fuente" in s
+            or "propietario_usuario_id" in s
+        )
+    )
+
+
+def _inject_banco_column_migrations(statements: list[str]) -> list[str]:
+    """
+    Garantiza ALTER de columnas Fase 7/8 inmediatamente después de
+    CREATE TABLE banco_preguntas y antes de índices/comentarios que las usen.
+    """
+    already = any(_is_banco_column_migration(s) for s in statements)
+    if already:
+        return statements
+
+    out: list[str] = []
+    injected = False
+    for stmt in statements:
+        out.append(stmt)
+        if not injected and _is_create_banco_preguntas(stmt):
+            out.extend(_BANCO_COLUMN_MIGRATIONS)
+            injected = True
+    if not injected:
+        # Tabla pudo crearse en un arranque previo: aún así hay que migrar.
+        out = list(_BANCO_COLUMN_MIGRATIONS) + out
+    return out
+
+
 def ensure_admission_schema(connection: DatabaseConnection | None = None) -> None:
     """
     Crea/migra las 5 tablas del simulador UNA + vistas/triggers.
@@ -143,7 +197,7 @@ def ensure_admission_schema(connection: DatabaseConnection | None = None) -> Non
     """
     conn = connection or db_connection
     sql = load_admission_ddl()
-    statements = _split_sql_statements(sql)
+    statements = _inject_banco_column_migrations(_split_sql_statements(sql))
     if not statements:
         raise RuntimeError("DDL de admisión vacío tras el parseo.")
 

@@ -27,12 +27,20 @@ import numpy as np
 import pandas as pd
 
 from app.infrastructure.database.connection import DatabaseConnection, db_connection
+from app.infrastructure.database.historial_repository import (
+    CierreSesionSimulacro,
+    HistorialRepository,
+    IntentoLedger,
+    historial_repository,
+)
 
 logger = logging.getLogger(__name__)
 
 AREA_DEFAULT = "BIOMEDICAS"
 TOTAL_OFICIAL = 60
 PUNTOS_CORRECTA = 10
+PUNTOS_EN_BLANCO = 2
+PUNTOS_INCORRECTA = 0
 
 # Intervalos (días) tipo SM-2 ligero según racha de aciertos consecutivos al final.
 _INTERVALOS_RACHA = {0: 1, 1: 1, 2: 3, 3: 7}  # 4+ → 15
@@ -127,6 +135,26 @@ class PracticaEnfocada:
         }
 
 
+@dataclass
+class ResultadoCierreBloque:
+    """Resumen tras persistir respuestas en historial_intentos."""
+
+    modo: str
+    n_insertados: int
+    correctas: int
+    incorrectas: int
+    en_blanco: int
+    puntaje_bruto: float
+    puntaje_ponderado: float
+    tiempo_total_ms: int
+    ids_intento: List[int] = field(default_factory=list)
+    id_sesion: Optional[int] = None
+    detalle_por_pregunta: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class TutorEngine:
     """
     Núcleo pedagógico: simulacro oficial (estratificado) + práctica libre (SRS).
@@ -140,8 +168,10 @@ class TutorEngine:
         weak_tema_boost: float = 3.0,
         weak_pregunta_boost: float = 2.0,
         min_intentos_tema: int = 2,
+        historial: Optional[HistorialRepository] = None,
     ) -> None:
         self._connection = connection or db_connection
+        self._historial = historial or historial_repository
         self.area_examen = area_examen
         self.weak_tema_boost = weak_tema_boost
         self.weak_pregunta_boost = weak_pregunta_boost
@@ -154,6 +184,7 @@ class TutorEngine:
         *,
         seed: Optional[int] = None,
         persistir_sesion: bool = True,
+        fuente_banco: str = "todo",
     ) -> SimulacroOficial:
         """
         Examen de 60 preguntas exactas.
@@ -168,7 +199,7 @@ class TutorEngine:
 
         catalogo = self._load_catalogo()
         self._assert_catalogo_60(catalogo)
-        banco = self._load_banco_activo()
+        banco = self._load_banco_activo(usuario_id=uid, fuente_banco=fuente_banco)
         if banco.empty:
             raise BancoInsuficienteError(
                 "banco_preguntas vacío. Cargue ítems antes del simulacro oficial."
@@ -270,6 +301,7 @@ class TutorEngine:
         limite: int = 15,
         *,
         seed: Optional[int] = None,
+        fuente_banco: str = "todo",
     ) -> PracticaEnfocada:
         """
         Bloque de estudio libre (sin cupos del prospecto).
@@ -288,10 +320,15 @@ class TutorEngine:
             int(seed if seed is not None else random.SystemRandom().randint(1, 2**31 - 1))
         )
 
-        banco = self._load_banco_activo(materia_id=materia_id, tema_id=tema_id)
+        banco = self._load_banco_activo(
+            materia_id=materia_id,
+            tema_id=tema_id,
+            usuario_id=uid,
+            fuente_banco=fuente_banco,
+        )
         if banco.empty:
             raise BancoInsuficienteError(
-                "No hay preguntas activas para el filtro materia/tema solicitado."
+                "No hay preguntas activas para el filtro materia/tema/fuente solicitado."
             )
 
         stats = self._load_stats_srs_por_pregunta(uid, banco["id_pregunta"].tolist())
@@ -343,6 +380,108 @@ class TutorEngine:
             resumen_prioridad=resumen,
         )
 
+    def generar_practica_debilidades(
+        self,
+        usuario_id: int,
+        *,
+        limite: int = 12,
+        top_temas: int = 5,
+        min_intentos: int = 2,
+        fuente_banco: str = "todo",
+        seed: Optional[int] = None,
+    ) -> PracticaEnfocada:
+        """
+        Práctica inteligente: mezcla preguntas de los temas con peor precisión
+        (misma lógica que alimenta el dashboard de rendimiento).
+        """
+        from app.services.student_dashboard_service import recomendar_temas_urgentes
+
+        uid = int(usuario_id)
+        lim = max(10, min(15, int(limite)))
+        rendimiento = self._historial.fetch_rendimiento_por_tema(uid)
+        urgentes = recomendar_temas_urgentes(
+            rendimiento,
+            min_intentos=int(min_intentos),
+            top_n=max(1, int(top_temas)),
+        )
+        if not urgentes:
+            # Sin muestra estadística: usa los de menor precisión aunque tengan 1 intento.
+            urgentes = recomendar_temas_urgentes(
+                rendimiento, min_intentos=1, top_n=max(1, int(top_temas))
+            )
+        if not urgentes:
+            raise BancoInsuficienteError(
+                "Aún no hay historial suficiente para detectar debilidades. "
+                "Haz primero una práctica o simulacro y vuelve a intentarlo."
+            )
+
+        tema_ids = [int(t["id_tema"]) for t in urgentes if t.get("id_tema") is not None]
+        rng = np.random.default_rng(
+            int(seed if seed is not None else random.SystemRandom().randint(1, 2**31 - 1))
+        )
+        banco = self._load_banco_activo(
+            tema_ids=tema_ids,
+            usuario_id=uid,
+            fuente_banco=fuente_banco,
+        )
+        if banco.empty:
+            raise BancoInsuficienteError(
+                "Hay temas débiles, pero no quedan preguntas activas en esas áreas "
+                "para la fuente elegida."
+            )
+
+        stats = self._load_stats_srs_por_pregunta(uid, banco["id_pregunta"].tolist())
+        ranked = self._rank_practica_srs(banco=banco, stats=stats, hoy=date.today(), rng=rng)
+        top = ranked.head(min(lim, len(ranked)))
+        preguntas: List[PreguntaTutor] = []
+        resumen = {
+            "vencidas": 0,
+            "alta_error": 0,
+            "nunca_vistas": 0,
+            "refuerzo": 0,
+            "temas_debiles": len(tema_ids),
+        }
+        for orden, (_, row) in enumerate(top.iterrows(), start=1):
+            motivo = str(row["motivo_prioridad"])
+            resumen[motivo] = resumen.get(motivo, 0) + 1
+            preguntas.append(
+                PreguntaTutor(
+                    orden=orden,
+                    id_pregunta=int(row["id_pregunta"]),
+                    materia_id=int(row["materia_id"]),
+                    materia_codigo=int(row["materia_codigo"]),
+                    materia_nombre=str(row["materia_nombre"]),
+                    factor_ponderacion=float(row["factor_ponderacion"]),
+                    tema_id=int(row["tema_id"]),
+                    tema_nombre=str(row["tema_nombre"]),
+                    enunciado=str(row["enunciado"]),
+                    alternativas=dict(row["alternativas"])
+                    if isinstance(row["alternativas"], dict)
+                    else row["alternativas"],
+                    alternativa_correcta=str(row["alternativa_correcta"]),
+                    peso_prioridad=float(row["peso_prioridad"]),
+                    motivo_prioridad=motivo,
+                    cantidad_cupo_materia=None,
+                )
+            )
+
+        logger.info(
+            "Práctica debilidades usuario=%s temas=%s n=%s resumen=%s",
+            uid,
+            tema_ids,
+            len(preguntas),
+            resumen,
+        )
+        return PracticaEnfocada(
+            usuario_id=uid,
+            materia_id=None,
+            tema_id=None,
+            limite=lim,
+            total_preguntas=len(preguntas),
+            preguntas=preguntas,
+            resumen_prioridad=resumen,
+        )
+
     # Alias explícito pedido por el plan de ejecución
     def generar_simulacro(self, usuario_id: int, **kwargs: Any) -> SimulacroOficial:
         return self.generar_simulacro_oficial(usuario_id, **kwargs)
@@ -360,6 +499,223 @@ class TutorEngine:
     @staticmethod
     def puntaje_ponderado_item(puntos_base: int, factor_ponderacion: float) -> float:
         return float(round(int(puntos_base) * float(factor_ponderacion), 3))
+
+    # ======================================================== Cierre / ledger
+    @staticmethod
+    def _normalizar_marcada(raw: Any) -> Optional[str]:
+        if raw is None:
+            return None
+        text = str(raw).strip().upper()
+        if not text or text not in {"A", "B", "C", "D", "E"}:
+            return None
+        return text
+
+    @classmethod
+    def evaluar_alternativa(
+        cls,
+        *,
+        alternativa_marcada: Optional[str],
+        alternativa_correcta: str,
+        factor_ponderacion: float,
+    ) -> Dict[str, Any]:
+        """
+        Reglas UNA: 10 correcta, 2 en blanco, 0 incorrecta.
+        En blanco ⇒ es_correcta NULL (coherente con CHECK del ledger).
+        """
+        marcada = cls._normalizar_marcada(alternativa_marcada)
+        correcta = str(alternativa_correcta or "").strip().upper()
+        factor = float(factor_ponderacion)
+
+        if marcada is None:
+            puntos = PUNTOS_EN_BLANCO
+            return {
+                "alternativa_marcada": None,
+                "es_correcta": None,
+                "puntaje_obtenido": puntos,
+                "puntaje_ponderado": cls.puntaje_ponderado_item(puntos, factor),
+            }
+
+        es_ok = marcada == correcta
+        puntos = PUNTOS_CORRECTA if es_ok else PUNTOS_INCORRECTA
+        return {
+            "alternativa_marcada": marcada,
+            "es_correcta": es_ok,
+            "puntaje_obtenido": puntos,
+            "puntaje_ponderado": cls.puntaje_ponderado_item(puntos, factor),
+        }
+
+    def _construir_intentos(
+        self,
+        *,
+        usuario_id: int,
+        preguntas: Sequence[PreguntaTutor],
+        respuestas: Dict[str, Any],
+        tiempos_ms: Dict[str, Any],
+        sesion_id: Optional[int],
+        incluir_orden: bool,
+    ) -> tuple[List[IntentoLedger], ResultadoCierreBloque]:
+        intentos: List[IntentoLedger] = []
+        detalle: List[Dict[str, Any]] = []
+        correctas = incorrectas = en_blanco = 0
+        puntaje_bruto = 0.0
+        puntaje_ponderado = 0.0
+        tiempo_total = 0
+
+        for preg in preguntas:
+            qid = int(preg.id_pregunta)
+            key = str(qid)
+            marcada_raw = respuestas.get(key, respuestas.get(qid))
+            eval_item = self.evaluar_alternativa(
+                alternativa_marcada=marcada_raw,
+                alternativa_correcta=preg.alternativa_correcta,
+                factor_ponderacion=preg.factor_ponderacion,
+            )
+            raw_t = tiempos_ms.get(key, tiempos_ms.get(qid, 0))
+            try:
+                t_ms = max(0, int(raw_t or 0))
+            except (TypeError, ValueError):
+                t_ms = 0
+
+            if eval_item["es_correcta"] is True:
+                correctas += 1
+            elif eval_item["es_correcta"] is False:
+                incorrectas += 1
+            else:
+                en_blanco += 1
+
+            puntaje_bruto += float(eval_item["puntaje_obtenido"])
+            puntaje_ponderado += float(eval_item["puntaje_ponderado"])
+            tiempo_total += t_ms
+
+            orden = int(preg.orden) if incluir_orden else None
+            intentos.append(
+                IntentoLedger(
+                    usuario_id=int(usuario_id),
+                    pregunta_id=qid,
+                    sesion_id=int(sesion_id) if sesion_id is not None else None,
+                    orden_en_sesion=orden,
+                    tiempo_respuesta_ms=t_ms,
+                    alternativa_marcada=eval_item["alternativa_marcada"],
+                    es_correcta=eval_item["es_correcta"],
+                    puntaje_obtenido=int(eval_item["puntaje_obtenido"]),
+                    factor_ponderacion_aplicado=float(preg.factor_ponderacion),
+                    puntaje_ponderado=float(eval_item["puntaje_ponderado"]),
+                )
+            )
+            detalle.append(
+                {
+                    "orden": preg.orden,
+                    "id_pregunta": qid,
+                    "materia_nombre": preg.materia_nombre,
+                    "tema_nombre": preg.tema_nombre,
+                    "alternativa_marcada": eval_item["alternativa_marcada"],
+                    "alternativa_correcta": preg.alternativa_correcta,
+                    "es_correcta": eval_item["es_correcta"],
+                    "puntaje_obtenido": eval_item["puntaje_obtenido"],
+                    "puntaje_ponderado": eval_item["puntaje_ponderado"],
+                    "tiempo_respuesta_ms": t_ms,
+                }
+            )
+
+        resumen = ResultadoCierreBloque(
+            modo="",
+            n_insertados=0,
+            correctas=correctas,
+            incorrectas=incorrectas,
+            en_blanco=en_blanco,
+            puntaje_bruto=float(round(puntaje_bruto, 3)),
+            puntaje_ponderado=float(round(puntaje_ponderado, 3)),
+            tiempo_total_ms=tiempo_total,
+            id_sesion=int(sesion_id) if sesion_id is not None else None,
+            detalle_por_pregunta=detalle,
+        )
+        return intentos, resumen
+
+    def finalizar_practica_enfocada(
+        self,
+        *,
+        practica: PracticaEnfocada,
+        respuestas: Dict[str, Any],
+        tiempos_ms: Optional[Dict[str, Any]] = None,
+    ) -> ResultadoCierreBloque:
+        """
+        Evalúa el bloque libre y hace INSERT en historial_intentos
+        con sesion_id = NULL (SRS / práctica libre).
+        """
+        if not practica.preguntas:
+            raise ValueError("La práctica no tiene preguntas para finalizar.")
+
+        intentos, resumen = self._construir_intentos(
+            usuario_id=practica.usuario_id,
+            preguntas=practica.preguntas,
+            respuestas=respuestas or {},
+            tiempos_ms=tiempos_ms or {},
+            sesion_id=None,
+            incluir_orden=False,
+        )
+        ids = self._historial.insert_intentos(intentos)
+        resumen.modo = "practica_enfocada"
+        resumen.n_insertados = len(ids)
+        resumen.ids_intento = ids
+        logger.info(
+            "Práctica finalizada usuario=%s n=%s correctas=%s tiempo_ms=%s",
+            practica.usuario_id,
+            len(ids),
+            resumen.correctas,
+            resumen.tiempo_total_ms,
+        )
+        return resumen
+
+    def finalizar_simulacro_oficial(
+        self,
+        *,
+        simulacro: SimulacroOficial,
+        respuestas: Dict[str, Any],
+        tiempos_ms: Optional[Dict[str, Any]] = None,
+    ) -> ResultadoCierreBloque:
+        """
+        INSERT ledger (con sesion_id) + UPDATE sesiones_simulacro → finalizada.
+        """
+        if not simulacro.preguntas:
+            raise ValueError("El simulacro no tiene preguntas para finalizar.")
+        if int(simulacro.id_sesion) <= 0:
+            raise ValueError(
+                "Simulacro sin id_sesion persistido; no se puede cerrar en BD."
+            )
+
+        intentos, resumen = self._construir_intentos(
+            usuario_id=simulacro.usuario_id,
+            preguntas=simulacro.preguntas,
+            respuestas=respuestas or {},
+            tiempos_ms=tiempos_ms or {},
+            sesion_id=int(simulacro.id_sesion),
+            incluir_orden=True,
+        )
+        cierre = CierreSesionSimulacro(
+            respuestas_correctas=resumen.correctas,
+            respuestas_incorrectas=resumen.incorrectas,
+            respuestas_en_blanco=resumen.en_blanco,
+            puntaje_bruto=resumen.puntaje_bruto,
+            puntaje_ponderado=resumen.puntaje_ponderado,
+            tiempo_total_ms=resumen.tiempo_total_ms,
+        )
+        persistido = self._historial.persistir_cierre_simulacro(
+            intentos=intentos,
+            id_sesion=int(simulacro.id_sesion),
+            usuario_id=int(simulacro.usuario_id),
+            cierre=cierre,
+        )
+        resumen.modo = "simulacro_oficial"
+        resumen.n_insertados = int(persistido["n_insertados"])
+        resumen.ids_intento = list(persistido["ids_intento"])
+        logger.info(
+            "Simulacro finalizado sesion=%s usuario=%s ponderado=%.3f tiempo_ms=%s",
+            simulacro.id_sesion,
+            simulacro.usuario_id,
+            resumen.puntaje_ponderado,
+            resumen.tiempo_total_ms,
+        )
+        return resumen
 
     # ============================================================== Loads
     def _load_catalogo(self) -> pd.DataFrame:
@@ -383,7 +739,18 @@ class TutorEngine:
         *,
         materia_id: Optional[int] = None,
         tema_id: Optional[int] = None,
+        tema_ids: Optional[Sequence[int]] = None,
+        usuario_id: Optional[int] = None,
+        fuente_banco: str = "todo",
     ) -> pd.DataFrame:
+        """
+        Carga ítems activos con aislamiento Fase 7.
+
+        fuente_banco:
+          - oficial → solo propietario_usuario_id IS NULL
+          - mis_guias → solo propietario_usuario_id = usuario_id
+          - todo → oficial OR del alumno (nunca de otros)
+        """
         clauses = ["p.activa", "m.area_examen = %s", "m.activo", "t.activo"]
         params: List[Any] = [self.area_examen]
         if materia_id is not None:
@@ -392,6 +759,30 @@ class TutorEngine:
         if tema_id is not None:
             clauses.append("t.id_tema = %s")
             params.append(int(tema_id))
+        if tema_ids:
+            ids = sorted({int(x) for x in tema_ids if x is not None})
+            if ids:
+                placeholders = ", ".join(["%s"] * len(ids))
+                clauses.append(f"t.id_tema IN ({placeholders})")
+                params.extend(ids)
+
+        scope = (fuente_banco or "todo").strip().lower()
+        if scope == "oficial":
+            clauses.append("p.propietario_usuario_id IS NULL")
+        elif scope == "mis_guias":
+            if usuario_id is None:
+                raise ValueError("fuente_banco=mis_guias requiere usuario_id.")
+            clauses.append("p.propietario_usuario_id = %s")
+            params.append(int(usuario_id))
+        else:
+            # todo: oficial + propias (aislamiento: nunca ver guías de otros)
+            if usuario_id is None:
+                clauses.append("p.propietario_usuario_id IS NULL")
+            else:
+                clauses.append(
+                    "(p.propietario_usuario_id IS NULL OR p.propietario_usuario_id = %s)"
+                )
+                params.append(int(usuario_id))
 
         query = f"""
         SELECT
@@ -405,7 +796,8 @@ class TutorEngine:
             m.factor_ponderacion,
             p.enunciado,
             p.alternativas,
-            p.alternativa_correcta
+            p.alternativa_correcta,
+            p.propietario_usuario_id
         FROM banco_preguntas p
         JOIN temas_estudio t ON t.id_tema = p.tema_id
         JOIN catalogo_materias m ON m.id_materia = t.materia_id
@@ -428,6 +820,7 @@ class TutorEngine:
                     "enunciado",
                     "alternativas",
                     "alternativa_correcta",
+                    "propietario_usuario_id",
                 ]
             )
         return pd.DataFrame(rows)

@@ -19,8 +19,11 @@ CREATE TABLE IF NOT EXISTS usuarios (
 );
 """
 
-# Sin FK inline: la tabla puede existir desde deploys previos sin usuarios.
-# La FK se agrega después en migraciones, una vez que usuarios existe.
+# 2) Memoria activa — DDL CONGELADO pero ACTIVO en ensure_schema.
+#    Decisión de estabilidad: no mover el DDL al archive; producción puede
+#    tener la tabla y migraciones deben seguir siendo idempotentes.
+#    El CRUD (MemoryCardRepository) permanece en repositories.py; la UI
+#    legacy vive en app.archive.legacy_nlp_system y no está montada.
 CREATE_MEMORIA_ACTIVA = """
 CREATE TABLE IF NOT EXISTS memoria_activa (
     id_tarjeta BIGSERIAL PRIMARY KEY,
@@ -49,6 +52,31 @@ CREATE TABLE IF NOT EXISTS memoria_activa (
     creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
+
+# Telemetría del tutor socrático (append-only, sin FK a historial_intentos / scoring).
+CREATE_TUTOR_INTERACCIONES = """
+CREATE TABLE IF NOT EXISTS tutor_interacciones (
+    id                  BIGSERIAL PRIMARY KEY,
+    usuario_id          BIGINT,
+    pregunta_id         BIGINT NOT NULL,
+    modo_origen         VARCHAR(40) NOT NULL DEFAULT 'desconocido',
+    mensaje_alumno      TEXT NOT NULL,
+    respuesta_ia        TEXT NOT NULL,
+    prompt_tokens       INTEGER,
+    completion_tokens   INTEGER,
+    model               VARCHAR(120),
+    method              VARCHAR(40),
+    spoilers_bloqueados BOOLEAN NOT NULL DEFAULT FALSE,
+    timestamp           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+CREATE_TUTOR_INTERACCIONES_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_tutor_interacciones_usuario ON tutor_interacciones(usuario_id);",
+    "CREATE INDEX IF NOT EXISTS idx_tutor_interacciones_pregunta ON tutor_interacciones(pregunta_id);",
+    "CREATE INDEX IF NOT EXISTS idx_tutor_interacciones_timestamp ON tutor_interacciones(timestamp DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_tutor_interacciones_modo ON tutor_interacciones(modo_origen);",
+]
 
 MIGRATION_STATEMENTS = [
     "ALTER TABLE memoria_activa ADD COLUMN IF NOT EXISTS area VARCHAR(120);",
@@ -130,6 +158,7 @@ def ensure_schema(connection: DatabaseConnection | None = None) -> None:
     2) tabla memoria_activa (heredada; no se modifica su forma productiva)
     3) columna usuario_id + FK/índices de Memoria Activa
     4) dominio Admisión UNA (5 tablas + vistas) — sin tocar memoria_activa
+    5) telemetría tutor_interacciones (sin FK a scoring)
     """
     conn = connection or db_connection
 
@@ -151,5 +180,52 @@ def ensure_schema(connection: DatabaseConnection | None = None) -> None:
 
     # 4) Simulador de admisión (catalogo / temas / banco / sesiones / historial)
     #    Aislado: solo CREATE IF NOT EXISTS + seeds idempotentes del DDL.
+    #    Las columnas Fase 7/8 se migran DENTRO de ensure_admission_schema
+    #    (ALTER antes de índices) para no fallar en DBs previas.
     ensure_admission_schema(conn)
     logger.info("Esquema: dominio admisión UNA materializado (memoria_activa intacta)")
+
+    # 4b) Red de seguridad idempotente (por si el DDL se ejecutó a mano sin ALTER)
+    for alter in (
+        "ALTER TABLE banco_preguntas ADD COLUMN IF NOT EXISTS nombre_archivo_fuente VARCHAR(255);",
+        "ALTER TABLE banco_preguntas ADD COLUMN IF NOT EXISTS propietario_usuario_id BIGINT;",
+        """
+        CREATE INDEX IF NOT EXISTS idx_banco_preguntas_propietario
+            ON banco_preguntas (propietario_usuario_id)
+            WHERE activa;
+        """,
+        # Dedup por dueño: oficial (NULL→0) y cada alumno tienen espacios separados.
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'uq_banco_hash_contenido'
+            ) THEN
+                ALTER TABLE banco_preguntas DROP CONSTRAINT uq_banco_hash_contenido;
+            END IF;
+        EXCEPTION
+            WHEN undefined_table THEN NULL;
+            WHEN undefined_object THEN NULL;
+            WHEN others THEN NULL;
+        END $$;
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_banco_hash_propietario
+            ON banco_preguntas (hash_contenido, (COALESCE(propietario_usuario_id, 0)));
+        """,
+    ):
+        _run_sql(conn, alter, critical=False)
+    logger.info("Esquema: migraciones bóveda (archivo + propietario) OK")
+
+    # 5) Telemetría tutor socrático (no crítica para arranque de examen)
+    _run_sql(conn, CREATE_TUTOR_INTERACCIONES, critical=False)
+    for idx_sql in CREATE_TUTOR_INTERACCIONES_INDEXES:
+        _run_sql(conn, idx_sql, critical=False)
+    for alter in (
+        "ALTER TABLE tutor_interacciones ADD COLUMN IF NOT EXISTS model VARCHAR(120);",
+        "ALTER TABLE tutor_interacciones ADD COLUMN IF NOT EXISTS method VARCHAR(40);",
+        "ALTER TABLE tutor_interacciones ADD COLUMN IF NOT EXISTS spoilers_bloqueados BOOLEAN NOT NULL DEFAULT FALSE;",
+    ):
+        _run_sql(conn, alter, critical=False)
+    logger.info("Esquema: tutor_interacciones (telemetría) OK")

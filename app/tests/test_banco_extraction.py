@@ -78,6 +78,8 @@ def test_payload_alias_preguntas() -> None:
 
 def test_slug_and_hash_estables() -> None:
     assert slugify_tema("Tejido Epitelial") == "tejido-epitelial"
+    assert slugify_tema("La ósmosis") == slugify_tema("Ósmosis") == "osmosis"
+    assert slugify_tema("El tejido epitelial") == "tejido-epitelial"
     h1 = hash_contenido_pregunta(
         "Enunciado  uno",
         {k: f"Alt {k}" for k in "ABCDE"},
