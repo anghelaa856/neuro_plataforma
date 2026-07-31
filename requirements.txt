@@ -3,7 +3,7 @@
 
 # Core UI + config
 streamlit>=1.44.0
-extra-streamlit-components
+extra-streamlit-components>=0.1.71,<0.2.0
 python-dotenv>=1.0.1
 
 # PostgreSQL (Neon) — binary obligatorio en Linux slim sin headers de libpq

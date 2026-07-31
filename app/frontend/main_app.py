@@ -37,56 +37,53 @@ from app.frontend.render_student_ingestion_tab import render_student_ingestion_t
 # Persistencia de sesión en móvil (cookie del navegador)
 _COOKIE_USER_SESSION = "user_session"
 _COOKIE_TTL_DAYS = 7
-# Intentos de hidratación JS del CookieManager antes de mostrar Login
-_COOKIE_HYDRATE_MAX_ATTEMPTS = 6
-_COOKIE_HYDRATE_SLEEP_S = 0.12
+# Un solo reintento de hidratación (sin sleep). Más reruns → OOM/SIGSEGV en HF free.
+_COOKIE_HYDRATE_MAX_ATTEMPTS = 1
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     """Compat: aduana de limpieza completa; devuelve texto cosido."""
-    doc = process_pdf(file_bytes, allow_ocr=True)
+    from app.services.pdf_processor import process_pdf as _process_pdf
+
+    doc = _process_pdf(file_bytes, allow_ocr=True)
     return doc.text
 
 
 def _get_cookie_manager() -> Any:
     """
-    CookieManager singleton por sesión Streamlit (key estable).
-    Crearlo en cada rerun dispara race conditions del componente JS.
+    CookieManager liviano y a prueba de fallos.
+
+    NO se guarda en session_state (el objeto del componente custom puede
+    corromper el runtime / provocar segfaults en Spaces).
     """
     if stx is None:
         return None
-    existing = st.session_state.get("_cookie_manager_singleton")
-    if existing is not None:
-        return existing
-    manager = stx.CookieManager(key="neuro_plataforma_cookie_manager")
-    st.session_state["_cookie_manager_singleton"] = manager
-    return manager
+    if st.session_state.get("_cookie_manager_disabled"):
+        return None
+    try:
+        return stx.CookieManager(key="neuro_plataforma_cookie_manager")
+    except Exception:
+        st.session_state["_cookie_manager_disabled"] = True
+        return None
 
 
-def _cookies_dict(cookie_manager: Any) -> Optional[Dict[str, Any]]:
-    """
-    None  → componente aún no hidrató (no decidir Login).
-    dict  → lectura usable (puede estar vacía si no hay cookies de app).
-    """
+def _cookies_dict(cookie_manager: Any) -> Dict[str, Any]:
+    """Siempre dict; nunca bloquea el arranque."""
     if cookie_manager is None:
         return {}
     try:
         raw = cookie_manager.get_all()
+        if isinstance(raw, dict):
+            return dict(raw)
     except Exception:
-        return None
-    if raw is None:
-        return None
-    if isinstance(raw, dict):
-        return dict(raw)
-    return None
+        pass
+    return {}
 
 
 def _read_user_session_cookie(cookie_manager: Any) -> Optional[str]:
     cookies = _cookies_dict(cookie_manager)
-    if cookies is None:
-        return None
     raw = cookies.get(_COOKIE_USER_SESSION)
-    if raw is None:
+    if raw is None and cookie_manager is not None:
         try:
             raw = cookie_manager.get(cookie=_COOKIE_USER_SESSION)
         except Exception:
@@ -105,7 +102,6 @@ def _write_user_session_cookie(cookie_manager: Any, email: str) -> None:
         return
     try:
         expires = datetime.now() + timedelta(days=_COOKIE_TTL_DAYS)
-        # key única evita colisión del widget en el mismo script-run
         set_key = f"neuro_set_user_session_{int(time.time() * 1000) % 1_000_000}"
         cookie_manager.set(
             _COOKIE_USER_SESSION,
@@ -133,7 +129,6 @@ def _delete_user_session_cookie(cookie_manager: Any) -> None:
         except Exception:
             pass
     except Exception:
-        # Fallback: invalidar valor (algunas versiones fallan en delete)
         try:
             cookie_manager.set(
                 _COOKIE_USER_SESSION,
@@ -152,94 +147,78 @@ def _resolve_user_from_session_token(token: str) -> Optional[Dict[str, Any]]:
     if not token_n:
         return None
     user: Optional[Dict[str, Any]] = None
-    if token_n.isdigit():
-        user = user_repository.get_by_id(int(token_n))
-    if user is None:
-        user = user_repository.get_by_email(token_n)
+    try:
+        if token_n.isdigit():
+            user = user_repository.get_by_id(int(token_n))
+        if user is None:
+            user = user_repository.get_by_email(token_n)
+    except Exception:
+        return None
     return user
-
-
-def _render_auth_loading(attempt: int, max_attempts: int) -> None:
-    st.title("🧠 Neuro Plataforma")
-    st.info(
-        "Reconectando y restaurando tu sesión… "
-        "No cierres esta pestaña."
-    )
-    st.progress(min(1.0, float(attempt) / float(max(max_attempts, 1))))
-    st.caption(f"Verificando cookie de sesión ({attempt}/{max_attempts})…")
 
 
 def bootstrap_auth_from_cookie(cookie_manager: Any) -> str:
     """
-    Máquina de estados anti-race para móvil / WebSocket reconnect.
+    Restaura sesión desde cookie sin bucles agresivos.
 
-    Returns:
-      ``authenticated`` | ``loading`` | ``anonymous``
+    Como máximo 1 ``st.rerun`` (sin ``time.sleep``) para dar tiempo al JS.
+    Evita el Exit 139 por OOM en el tier gratuito de Hugging Face.
     """
-    if _current_user():
-        return "authenticated"
-
-    # Logout explícito en esta sesión de navegador (session_state aún vivo)
-    if st.session_state.get("_explicit_logout"):
-        return "anonymous"
-
-    if cookie_manager is None:
-        return "anonymous"
-
-    attempts = int(st.session_state.get("_cookie_hydrate_attempts") or 0)
-    cookies = _cookies_dict(cookie_manager)
-
-    # 1) Componente JS aún no listo → NUNCA mostrar Login
-    if cookies is None:
-        attempts += 1
-        st.session_state["_cookie_hydrate_attempts"] = attempts
-        if attempts <= _COOKIE_HYDRATE_MAX_ATTEMPTS:
-            _render_auth_loading(attempts, _COOKIE_HYDRATE_MAX_ATTEMPTS)
-            time.sleep(_COOKIE_HYDRATE_SLEEP_S)
-            st.rerun()
-        return "anonymous"
-
-    token = cookies.get(_COOKIE_USER_SESSION)
-    if not token:
-        try:
-            token = cookie_manager.get(cookie=_COOKIE_USER_SESSION)
-        except Exception:
-            token = None
-    token_s = str(token).strip() if token is not None else ""
-
-    # 2) Dict vacío en los primeros intentos: suele ser falso negativo post-reconnect
-    if not token_s and len(cookies) == 0 and attempts < _COOKIE_HYDRATE_MAX_ATTEMPTS:
-        attempts += 1
-        st.session_state["_cookie_hydrate_attempts"] = attempts
-        _render_auth_loading(attempts, _COOKIE_HYDRATE_MAX_ATTEMPTS)
-        time.sleep(_COOKIE_HYDRATE_SLEEP_S)
-        st.rerun()
-
-    if not token_s:
-        st.session_state["_cookie_hydrate_attempts"] = attempts
-        return "anonymous"
-
-    # 3) Cookie presente → rehidratar desde Neon (fuente de verdad del perfil)
     try:
+        if _current_user():
+            return "authenticated"
+
+        if st.session_state.get("_explicit_logout"):
+            return "anonymous"
+
+        if cookie_manager is None:
+            return "anonymous"
+
+        attempts = int(st.session_state.get("_cookie_hydrate_attempts") or 0)
+        cookies = _cookies_dict(cookie_manager)
+        token_s = str(cookies.get(_COOKIE_USER_SESSION) or "").strip()
+        if not token_s:
+            try:
+                raw = cookie_manager.get(cookie=_COOKIE_USER_SESSION)
+                token_s = str(raw or "").strip()
+            except Exception:
+                token_s = ""
+
+        # Primer frame típico: get_all() = {} antes de hidratar JS → un solo rerun.
+        if (
+            not token_s
+            and attempts < _COOKIE_HYDRATE_MAX_ATTEMPTS
+            and not st.session_state.get("_cookie_hydrate_finished")
+        ):
+            st.session_state["_cookie_hydrate_attempts"] = attempts + 1
+            # UI mínima (sin sleep): el rerun remonta el componente una vez.
+            st.info("Restaurando sesión…")
+            st.rerun()
+
+        st.session_state["_cookie_hydrate_finished"] = True
+
+        if not token_s:
+            return "anonymous"
+
         user = _resolve_user_from_session_token(token_s)
+        if not user:
+            _delete_user_session_cookie(cookie_manager)
+            return "anonymous"
+
+        _establish_user_session(
+            user,
+            cookie_manager=cookie_manager,
+            clear_study_state=False,
+            refresh_cookie=True,
+            restored_from_cookie=True,
+        )
+        st.session_state["_cookie_hydrate_attempts"] = 0
+        st.session_state["_session_restored_banner"] = True
+        return "authenticated"
     except Exception:
-        user = None
-
-    if not user:
-        # Cookie huérfana / usuario borrado
-        _delete_user_session_cookie(cookie_manager)
+        # Cualquier fallo de cookies → login normal (nunca tumbar el proceso)
+        st.session_state["_cookie_manager_disabled"] = True
         return "anonymous"
-
-    _establish_user_session(
-        user,
-        cookie_manager=cookie_manager,
-        clear_study_state=False,
-        refresh_cookie=True,
-        restored_from_cookie=True,
-    )
-    st.session_state["_cookie_hydrate_attempts"] = 0
-    st.session_state["_session_restored_banner"] = True
-    return "authenticated"
 
 
 def init_runtime() -> None:
@@ -272,13 +251,16 @@ def init_runtime() -> None:
         if key not in st.session_state:
             st.session_state[key] = value
 
-    db_manager.connect()
-    db_manager.ensure_schema()
+    # Boot DB perezoso y tolerante: un fallo de Neon no debe tumbar el proceso.
     try:
-        seed_catalogo_materias(ensure_schema_first=False)
-    except Exception:
-        # Catálogo puede venir del DDL; no bloquear la UI
-        pass
+        db_manager.connect(minconn=1, maxconn=2)
+        db_manager.ensure_schema()
+        try:
+            seed_catalogo_materias(ensure_schema_first=False)
+        except Exception:
+            pass
+    except Exception as exc:
+        st.session_state["_db_boot_error"] = str(exc)
 
 
 def _current_user() -> Optional[Dict[str, Any]]:
@@ -351,6 +333,7 @@ def _logout(*, cookie_manager: Any = None) -> None:
     st.session_state["socratic_chats"] = {}
     st.session_state["_explicit_logout"] = True
     st.session_state["_cookie_hydrate_attempts"] = _COOKIE_HYDRATE_MAX_ATTEMPTS + 1
+    st.session_state["_cookie_hydrate_finished"] = True
     st.session_state.pop("_session_restored_banner", None)
     _delete_user_session_cookie(cookie_manager)
 
@@ -379,6 +362,23 @@ def render_auth_gate(*, cookie_manager: Any = None) -> bool:
         "Inicia sesión o crea una cuenta para guardar tu progreso. "
         "En el celular, tu sesión se recuerda hasta 7 días (cookie segura)."
     )
+    if st.session_state.get("_db_boot_error"):
+        st.error(
+            "No se pudo conectar a la base de datos al arrancar. "
+            f"Detalle: {st.session_state['_db_boot_error']}"
+        )
+
+    # Reintento manual (móvil): evita bucles automáticos agresivos
+    if cookie_manager is not None and st.button(
+        "🔄 Restaurar sesión guardada",
+        use_container_width=True,
+        key="btn_restore_cookie_session",
+    ):
+        st.session_state["_explicit_logout"] = False
+        st.session_state["_cookie_hydrate_attempts"] = 0
+        st.session_state["_cookie_hydrate_finished"] = False
+        st.session_state.pop("_cookie_manager_disabled", None)
+        st.rerun()
 
     tab_login, tab_register = st.tabs(["Iniciar sesión", "Registrarse"])
 
@@ -1419,5 +1419,12 @@ def render_practica_enfocada_tab() -> None:
 
 
 if __name__ == "__main__":
-    init_runtime()
+    # Arranque defensivo: nunca dejar que un fallo de boot tumbe el worker (SIGSEGV/OOM).
+    try:
+        init_runtime()
+    except Exception as _boot_exc:
+        try:
+            st.session_state["_db_boot_error"] = str(_boot_exc)
+        except Exception:
+            pass
     build_ui()
