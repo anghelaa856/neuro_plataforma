@@ -6,3 +6,15 @@ headless = true
 enableCORS = false
 enableXsrfProtection = false
 maxUploadSize = 30
+# Compresión WS: menos bytes en redes móviles inestables (HF Spaces)
+enableWebsocketCompression = true
+# Mensajes un poco más holgados (PDF/chunks) sin disparar OOM
+maxMessageSize = 300
+
+[runner]
+# Re-ejecuciones más rápidas tras reconnect del WebSocket
+fastReruns = true
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = true
