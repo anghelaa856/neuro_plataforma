@@ -34,10 +34,22 @@
 		}
 	}
 
+	# Clientes con caché agresiva aún piden el antiguo Streamlit (/_stcore/stream).
+	# Responder 410 evita “Connecting…” infinito hacia un protocolo inexistente.
+	@legacy_streamlit path /_stcore /_stcore/*
+	handle @legacy_streamlit {
+		respond "This Space now runs Reflex (not Streamlit). Hard-refresh or clear site data." 410
+	}
+
 	handle {
 		root * /srv
 		try_files {path} /index.html
 		file_server
+		# Evita servir HTML/JS obsoleto desde caché del navegador tras redeploy
+		@immutable path *.js *.css *.woff2
+		header @immutable Cache-Control "public, max-age=31536000, immutable"
+		header /index.html Cache-Control "no-cache, no-store, must-revalidate"
+		header /env.json Cache-Control "no-cache, no-store, must-revalidate"
 	}
 
 	header {

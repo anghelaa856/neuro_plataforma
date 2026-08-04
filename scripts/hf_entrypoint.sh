@@ -135,10 +135,14 @@ echo "[hf] Iniciando Caddy en :${PORT}…"
 caddy start --config /app/Caddyfile --adapter caddyfile
 
 echo "[hf] Iniciando Reflex backend-only en :${BACKEND_PORT}…"
-# `exec` → PID 1 = backend (logs limpios en HF)
+# Backend-only: nunca pasar --frontend-port ni dejar REFLEX_FRONTEND_PORT
+# (rxconfig también omite frontend_port en producción).
+unset REFLEX_FRONTEND_PORT || true
+export REFLEX_BACKEND_ONLY=1
 cd /app
 exec reflex run \
   --env prod \
   --backend-only \
   --backend-port "${BACKEND_PORT}" \
+  --backend-host 0.0.0.0 \
   --loglevel info

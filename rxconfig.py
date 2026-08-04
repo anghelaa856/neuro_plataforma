@@ -36,20 +36,29 @@ def _public_app_url() -> str | None:
 IS_PROD = _is_production()
 PUBLIC_URL = _public_app_url()
 
-# Local: frontend 3005 / backend 8005 (dev). Contenedor: Caddy 7860 → backend 8000.
+# Local: frontend 3005 / backend 8005 (dev).
+# Contenedor HF: Caddy publica :7860; Reflex corre SOLO backend en :8000.
+# Importante: en prod NO fijar frontend_port — Reflex 0.9.7 hace:
+#   frontend_port = cli_or_config.frontend_port
+# y aborta con "Cannot specify --frontend-port when not running frontend"
+# si se usa --backend-only con frontend_port distinto de None.
 if IS_PROD:
-    FRONTEND_PORT = int(os.getenv("PORT", os.getenv("FRONTEND_PORT", "7860")))
+    PUBLIC_PORT = int(os.getenv("PORT", "7860"))  # solo Caddy
     BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
-    # El browser habla con el origen público (mismo host que Caddy).
-    API_URL = PUBLIC_URL or os.getenv("REFLEX_API_URL") or f"http://127.0.0.1:{FRONTEND_PORT}"
+    FRONTEND_PORT = None
+    API_URL = (
+        PUBLIC_URL
+        or (os.getenv("REFLEX_API_URL") or "").strip().rstrip("/")
+        or f"http://127.0.0.1:{PUBLIC_PORT}"
+    )
     DEPLOY_URL = API_URL
     REDIS_URL = os.getenv("REFLEX_REDIS_URL", "redis://127.0.0.1:6379")
     STATE_MODE = "redis"
     CORS = [API_URL] if API_URL.startswith("https://") else ["*"]
 else:
-    FRONTEND_PORT = int(os.getenv("FRONTEND_PORT", "3005"))
+    PUBLIC_PORT = int(os.getenv("FRONTEND_PORT", "3005"))
+    FRONTEND_PORT = PUBLIC_PORT
     BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8005"))
-    # Dev en LAN: override con REFLEX_API_URL o deja el host de tu PC.
     API_URL = os.getenv("REFLEX_API_URL", "http://192.168.100.5:8005")
     DEPLOY_URL = os.getenv("REFLEX_DEPLOY_URL", "http://192.168.100.5:3005")
     REDIS_URL = os.getenv("REFLEX_REDIS_URL")  # opcional en local
@@ -57,23 +66,20 @@ else:
     CORS = ["*"]
 
 
-config = rx.Config(
-    app_name="neuro_plataforma",
-    host="0.0.0.0",
-    backend_host="0.0.0.0",
-    frontend_port=FRONTEND_PORT,
-    backend_port=BACKEND_PORT,
-    api_url=API_URL,
-    deploy_url=DEPLOY_URL,
-    # Imprescindible detrás de reverse-proxy / HF / túneles
-    vite_allowed_hosts=True,
-    cors_allowed_origins=CORS,
-    # Redis en prod → state compartido entre conexiones (simulacros concurrentes)
-    redis_url=REDIS_URL,
-    state_manager_mode=STATE_MODE,
-    # Telemetría off en Spaces
-    show_built_with_reflex=not IS_PROD and _env_bool("SHOW_BUILT_WITH_REFLEX", False),
-    plugins=[
+_config_kwargs: dict = {
+    "app_name": "neuro_plataforma",
+    "host": "0.0.0.0",
+    "backend_host": "0.0.0.0",
+    "backend_port": BACKEND_PORT,
+    "api_url": API_URL,
+    "deploy_url": DEPLOY_URL,
+    "vite_allowed_hosts": True,
+    "cors_allowed_origins": CORS,
+    "redis_url": REDIS_URL,
+    "state_manager_mode": STATE_MODE,
+    "show_built_with_reflex": (not IS_PROD)
+    and _env_bool("SHOW_BUILT_WITH_REFLEX", False),
+    "plugins": [
         rx.plugins.SitemapPlugin(),
         rx.plugins.TailwindV4Plugin(),
         rx.plugins.RadixThemesPlugin(
@@ -86,4 +92,10 @@ config = rx.Config(
             )
         ),
     ],
-)
+}
+
+# Solo en local pasamos frontend_port (Vite). En prod backend-only → omitir.
+if FRONTEND_PORT is not None:
+    _config_kwargs["frontend_port"] = FRONTEND_PORT
+
+config = rx.Config(**_config_kwargs)
