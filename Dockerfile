@@ -13,9 +13,10 @@
 # =============================================================================
 
 ARG PORT=7860
-# Placeholder de build. Reflex lowercassea hostnames al armar wss://…
-# El entrypoint reemplaza __public_host__ / neuro-placeholder.invalid en runtime.
-ARG API_URL=https://__PUBLIC_HOST__
+# Importante: http://localhost activa SAME_DOMAIN_HOSTNAMES en getBackendURL
+# (Reflex sustituye el host por window.location en el navegador del Space).
+# NO usar placeholders con "_" — new URL() del browser los rechaza.
+ARG API_URL=http://localhost
 
 # ---------------------------------------------------------------------------
 # Stage 1 — builder: deps + export estático del frontend Reflex
@@ -54,6 +55,7 @@ ENV PORT=${PORT} \
     APP_ENV=production
 
 # Compila frontend y deja artefactos en /srv (sin zip)
+# cache-bust: api_url=http://localhost (SAME_DOMAIN) — 2026-08-03
 RUN mkdir -p /srv \
     && reflex export --frontend-only --no-zip --loglevel info \
     && cp -a .web/build/client/. /srv/ \
@@ -67,7 +69,7 @@ RUN mkdir -p /srv \
 FROM python:3.11-slim-bookworm AS runtime
 
 ARG PORT=7860
-ARG API_URL=https://__PUBLIC_HOST__
+ARG API_URL=http://localhost
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

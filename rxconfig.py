@@ -46,15 +46,23 @@ if IS_PROD:
     PUBLIC_PORT = int(os.getenv("PORT", "7860"))  # solo Caddy
     BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
     FRONTEND_PORT = None
-    # Nunca dejar el placeholder de build en api_url del backend.
-    _raw_api = (PUBLIC_URL or (os.getenv("REFLEX_API_URL") or "").strip().rstrip("/"))
-    if not _raw_api or "public_host" in _raw_api.lower() or "neuro-placeholder" in _raw_api.lower():
-        _raw_api = f"http://127.0.0.1:{PUBLIC_PORT}"
-    API_URL = _raw_api
+    # Build/export: REFLEX_API_URL=http://localhost → frontend SAME_DOMAIN.
+    # Runtime HF: PUBLIC_URL / SPACE_HOST → CORS y backend con origen real.
+    _env_api = (os.getenv("REFLEX_API_URL") or "").strip().rstrip("/")
+    if PUBLIC_URL and "public_host" not in PUBLIC_URL.lower():
+        API_URL = PUBLIC_URL
+        CORS = [PUBLIC_URL]
+    elif _env_api and "public_host" not in _env_api.lower() and "_" not in (
+        _env_api.split("://", 1)[-1].split("/", 1)[0]
+    ):
+        API_URL = _env_api
+        CORS = ["*"] if "localhost" in API_URL or "127.0.0.1" in API_URL else [API_URL]
+    else:
+        API_URL = "http://localhost"
+        CORS = ["*"]
     DEPLOY_URL = API_URL
     REDIS_URL = os.getenv("REFLEX_REDIS_URL", "redis://127.0.0.1:6379")
     STATE_MODE = "redis"
-    CORS = [API_URL] if API_URL.startswith("https://") else ["*"]
 else:
     PUBLIC_PORT = int(os.getenv("FRONTEND_PORT", "3005"))
     FRONTEND_PORT = PUBLIC_PORT
