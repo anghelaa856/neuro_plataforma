@@ -1938,14 +1938,31 @@ class DashboardState(rx.State):
     loaded: bool = False
     empty: bool = True
     error: str = ""
+
+    # Hero / Índice Medicina
     indice: float = 0.0
     estado: str = ""
     frase: str = ""
+    banda: str = ""
     total_intentos: int = 0
     precision_pct: float = 0.0
-    mision: str = ""
+    has_delta: bool = False
+    delta_semanal: float = 0.0
+    tendencia: str = "na"  # up | down | flat | na
+    tendencia_label: str = ""
+
+    # Misión semanal (primitivos — nunca str(dict))
+    mision_texto: str = ""
+    mision_tema: str = ""
+    mision_materia: str = ""
+    mision_desde: int = 0
+    mision_hasta: int = 0
+    has_mision: bool = False
     cuello: str = ""
+
+    # Desglose + actividad (dicts planos para rx.foreach)
     materias_resumen: list[dict[str, Any]] = []
+    actividad_reciente: list[dict[str, Any]] = []
 
     def clear(self):
         self.loaded = False
@@ -1954,11 +1971,62 @@ class DashboardState(rx.State):
         self.indice = 0.0
         self.estado = ""
         self.frase = ""
+        self.banda = ""
         self.total_intentos = 0
         self.precision_pct = 0.0
-        self.mision = ""
+        self.has_delta = False
+        self.delta_semanal = 0.0
+        self.tendencia = "na"
+        self.tendencia_label = ""
+        self.mision_texto = ""
+        self.mision_tema = ""
+        self.mision_materia = ""
+        self.mision_desde = 0
+        self.mision_hasta = 0
+        self.has_mision = False
         self.cuello = ""
         self.materias_resumen = []
+        self.actividad_reciente = []
+
+    @staticmethod
+    def _relativo_es(ts: Any) -> str:
+        from datetime import datetime, timezone
+
+        if ts is None:
+            return ""
+        if isinstance(ts, str):
+            try:
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                return str(ts)[:16]
+        if not hasattr(ts, "astimezone"):
+            return ""
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        delta = now - ts.astimezone(timezone.utc)
+        secs = max(0, int(delta.total_seconds()))
+        if secs < 60:
+            return "hace un momento"
+        if secs < 3600:
+            return f"hace {secs // 60} min"
+        if secs < 86400:
+            return f"hace {secs // 3600} h"
+        days = secs // 86400
+        if days == 1:
+            return "ayer"
+        if days < 7:
+            return f"hace {days} días"
+        return ts.astimezone(timezone.utc).strftime("%d/%m/%Y")
+
+    @staticmethod
+    def _color_scheme_precision(precision_pct: float) -> str:
+        p = float(precision_pct or 0.0)
+        if p < 55.0:
+            return "red"
+        if p < 85.0:
+            return "amber"
+        return "green"
 
     @rx.event
     def load(self, usuario_id: int = 0):
@@ -1979,21 +2047,26 @@ class DashboardState(rx.State):
                 resumen_por_materia,
             )
 
-            kpis = sb.historial_repo().fetch_kpis_alumno(int(usuario_id))
-            por_tema = sb.historial_repo().fetch_rendimiento_por_tema(int(usuario_id))
-            ventanas = sb.historial_repo().fetch_precision_ventanas(
-                int(usuario_id), dias=7
-            )
+            repo = sb.historial_repo()
+            kpis = repo.fetch_kpis_alumno(int(usuario_id))
+            por_tema = repo.fetch_rendimiento_por_tema(int(usuario_id))
+            ventanas = repo.fetch_precision_ventanas(int(usuario_id), dias=7)
+            recientes = repo.fetch_temas_recientes(int(usuario_id), limit=5)
+
             total = int(kpis.get("total_intentos") or 0)
             self.total_intentos = total
             self.precision_pct = float(kpis.get("precision_pct") or 0)
             if total == 0:
                 self.empty = True
                 self.loaded = True
-                self.mision = (
+                self.has_mision = False
+                self.mision_texto = (
                     "Completa una práctica o simulacro para armar tu Índice Medicina."
                 )
+                self.actividad_reciente = []
+                self.materias_resumen = []
                 return
+
             indice = calcular_indice_medicina(
                 precision_pct=self.precision_pct,
                 total_intentos=total,
@@ -2002,29 +2075,99 @@ class DashboardState(rx.State):
             )
             plan = construir_plan_semanal(por_tema, min_intentos=3)
             materias = enriquecer_resumen_con_dominio(resumen_por_materia(por_tema))
+
             self.indice = float(indice.get("indice") or 0)
             self.estado = str(indice.get("estado") or "")
             self.frase = str(indice.get("frase_pronostico") or "")
-            self.mision = str(plan.get("mision") or "")
+            self.banda = str(indice.get("banda") or "")
+
+            delta = indice.get("delta_semanal")
+            if delta is None:
+                self.has_delta = False
+                self.delta_semanal = 0.0
+                self.tendencia = "na"
+                self.tendencia_label = "Sin historial semanal aún"
+            else:
+                d = float(delta)
+                self.has_delta = True
+                self.delta_semanal = d
+                if d > 0.3:
+                    self.tendencia = "up"
+                    self.tendencia_label = f"+{d:.1f} pts esta semana"
+                elif d < -0.3:
+                    self.tendencia = "down"
+                    self.tendencia_label = f"{d:.1f} pts esta semana"
+                else:
+                    self.tendencia = "flat"
+                    self.tendencia_label = f"{d:+.1f} pts · estable"
+
+            mision = plan.get("mision")
+            if isinstance(mision, dict) and mision:
+                tema = str(mision.get("tema_nombre") or "tema")
+                desde = int(round(float(mision.get("desde_pct") or 0.0)))
+                hasta = int(round(float(mision.get("hasta_pct") or 0.0)))
+                materia = str(mision.get("materia_nombre") or "")
+                self.mision_tema = tema
+                self.mision_materia = materia
+                self.mision_desde = desde
+                self.mision_hasta = hasta
+                self.mision_texto = str(
+                    mision.get("texto")
+                    or (
+                        f"Tu foco de esta semana: {tema}. "
+                        f"¡Súbelo del {desde} al {hasta}%!"
+                    )
+                )
+                self.has_mision = True
+            else:
+                self.mision_tema = ""
+                self.mision_materia = ""
+                self.mision_desde = 0
+                self.mision_hasta = 0
+                self.mision_texto = ""
+                self.has_mision = False
+
             cuello = plan.get("cuello_botella") or {}
             self.cuello = str(
-                cuello.get("tema_nombre") or cuello.get("nombre") or ""
+                cuello.get("tema_nombre") or self.mision_tema or ""
             )
-            # Normalizar materias a dicts simples (+ Nivel de Dominio)
-            clean = []
+
+            clean: list[dict[str, Any]] = []
             if isinstance(materias, list):
                 for m in materias[:12]:
-                    if isinstance(m, dict):
-                        clean.append(
-                            {
-                                "nombre": str(m.get("materia_nombre") or ""),
-                                "precision": float(m.get("precision_pct") or 0),
-                                "intentos": int(m.get("n_intentos") or 0),
-                                "dominio": str(m.get("dominio_etiqueta") or ""),
-                                "dominio_score": float(m.get("dominio_score") or 0),
-                            }
-                        )
+                    if not isinstance(m, dict):
+                        continue
+                    prec = float(m.get("precision_pct") or 0)
+                    score = float(m.get("dominio_score") or 0)
+                    clean.append(
+                        {
+                            "nombre": str(m.get("materia_nombre") or ""),
+                            "precision": prec,
+                            "precision_label": f"{prec:.0f}%",
+                            "intentos": int(m.get("n_intentos") or 0),
+                            "dominio": str(m.get("dominio_etiqueta") or ""),
+                            "dominio_score": score,
+                            "color_scheme": self._color_scheme_precision(prec),
+                        }
+                    )
             self.materias_resumen = clean
+
+            act: list[dict[str, Any]] = []
+            for row in recientes:
+                prec = float(row.get("precision_pct") or 0)
+                act.append(
+                    {
+                        "tema": str(row.get("tema_nombre") or ""),
+                        "materia": str(row.get("materia_nombre") or ""),
+                        "precision": prec,
+                        "precision_label": f"{prec:.0f}%",
+                        "intentos": int(row.get("n_intentos") or 0),
+                        "cuando": self._relativo_es(row.get("ultimo_en")),
+                        "color_scheme": self._color_scheme_precision(prec),
+                    }
+                )
+            self.actividad_reciente = act
+
             self.empty = False
             self.loaded = True
         except Exception as exc:

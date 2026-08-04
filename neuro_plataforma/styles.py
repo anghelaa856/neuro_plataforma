@@ -15,6 +15,9 @@ COLORS = {
     "danger": "#B91C1C",
     "danger_bg": "#FEF2F2",
     "danger_border": "#FCA5A5",
+    "warning": "#B45309",
+    "warning_bg": "#FFFBEB",
+    "warning_border": "#FCD34D",
     "slate": "#334155",
 }
 

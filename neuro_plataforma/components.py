@@ -20,15 +20,15 @@ from neuro_plataforma.styles import COLORS, OPTION_BASE, PAGE_BG, SURFACE_CARD
 
 
 def _card(*children, **props) -> rx.Component:
-    return rx.box(
-        *children,
-        background=SURFACE_CARD["background"],
-        border=SURFACE_CARD["border"],
-        border_radius=SURFACE_CARD["border_radius"],
-        box_shadow=SURFACE_CARD["box_shadow"],
-        width="100%",
-        **props,
-    )
+    base = {
+        "background": SURFACE_CARD["background"],
+        "border": SURFACE_CARD["border"],
+        "border_radius": SURFACE_CARD["border_radius"],
+        "box_shadow": SURFACE_CARD["box_shadow"],
+        "width": "100%",
+    }
+    base.update(props)
+    return rx.box(*children, **base)
 
 
 def brand_mark(compact: bool = False) -> rx.Component:
@@ -1267,21 +1267,439 @@ def ingest_tab(*, admin: bool = False) -> rx.Component:
 
 
 
-def dashboard_tab() -> rx.Component:
-    return _card(
+def _dash_header() -> rx.Component:
+    return rx.hstack(
         rx.vstack(
-            rx.heading("Mi rendimiento", size="6"),
+            rx.heading(
+                "Mi rendimiento",
+                size="6",
+                color=COLORS["ink"],
+                letter_spacing="-0.02em",
+            ),
             rx.text(
-                "Índice Medicina, plan semanal y foco por materia.",
+                "Tu brújula hacia Medicina · Índice, foco semanal y dominio por materia.",
                 color=COLORS["muted"],
                 size="2",
             ),
-            rx.button(
-                "Actualizar",
-                on_click=DashboardState.load(AuthState.usuario_id),
-                variant="soft",
-                size="2",
+            spacing="1",
+            align="start",
+        ),
+        rx.spacer(),
+        rx.button(
+            rx.icon("refresh-cw", size=16),
+            "Actualizar",
+            on_click=DashboardState.load(AuthState.usuario_id),
+            variant="soft",
+            size="2",
+            color_scheme="blue",
+        ),
+        width="100%",
+        align="start",
+    )
+
+
+def _dash_empty() -> rx.Component:
+    return rx.vstack(
+        rx.callout(
+            "Aún no hay intentos. Completa una práctica o simulacro para armar tu Índice Medicina.",
+            icon="info",
+            color_scheme="blue",
+            width="100%",
+        ),
+        rx.button(
+            "Ir a Práctica enfocada",
+            on_click=AppState.set_tab("practica"),
+            color_scheme="blue",
+            high_contrast=True,
+            size="3",
+        ),
+        spacing="3",
+        width="100%",
+        align="start",
+    )
+
+
+def _metric_card(
+    label: str,
+    *body,
+    accent: str | None = None,
+) -> rx.Component:
+    props: dict = {
+        "padding": "1.1rem 1.2rem",
+        "height": "100%",
+    }
+    if accent:
+        props["border_top"] = f"3px solid {accent}"
+    return _card(
+        rx.vstack(
+            rx.text(
+                label,
+                size="1",
+                weight="medium",
+                color=COLORS["muted"],
+                letter_spacing="0.04em",
+                text_transform="uppercase",
             ),
+            *body,
+            spacing="2",
+            align="start",
+            width="100%",
+        ),
+        **props,
+    )
+
+
+def _dash_hero_metrics() -> rx.Component:
+    tendencia_icon = rx.cond(
+        DashboardState.tendencia == "up",
+        rx.icon("trending-up", size=22, color=COLORS["success"]),
+        rx.cond(
+            DashboardState.tendencia == "down",
+            rx.icon("trending-down", size=22, color=COLORS["danger"]),
+            rx.cond(
+                DashboardState.tendencia == "flat",
+                rx.icon("minus", size=22, color=COLORS["muted"]),
+                rx.icon("activity", size=22, color=COLORS["muted"]),
+            ),
+        ),
+    )
+    tendencia_color = rx.cond(
+        DashboardState.tendencia == "up",
+        COLORS["success"],
+        rx.cond(
+            DashboardState.tendencia == "down",
+            COLORS["danger"],
+            COLORS["ink"],
+        ),
+    )
+    return rx.vstack(
+        rx.text(
+            DashboardState.estado,
+            size="2",
+            weight="medium",
+            color=COLORS["slate"],
+        ),
+        rx.box(
+            _metric_card(
+                "Índice Medicina",
+                rx.hstack(
+                    rx.heading(
+                        DashboardState.indice,
+                        size="8",
+                        color=COLORS["brand"],
+                        letter_spacing="-0.03em",
+                    ),
+                    rx.badge(
+                        DashboardState.banda,
+                        color_scheme="blue",
+                        variant="soft",
+                        size="2",
+                    ),
+                    spacing="3",
+                    align="center",
+                ),
+                rx.text(DashboardState.frase, size="1", color=COLORS["muted"]),
+                accent=COLORS["brand"],
+            ),
+            _metric_card(
+                "Intentos registrados",
+                rx.heading(
+                    DashboardState.total_intentos,
+                    size="8",
+                    color=COLORS["ink"],
+                    letter_spacing="-0.03em",
+                ),
+                rx.text(
+                    DashboardState.precision_pct,
+                    "% de precisión global",
+                    size="1",
+                    color=COLORS["muted"],
+                ),
+                accent=COLORS["slate"],
+            ),
+            _metric_card(
+                "Tendencia semanal",
+                rx.hstack(
+                    tendencia_icon,
+                    rx.heading(
+                        DashboardState.tendencia_label,
+                        size="5",
+                        color=tendencia_color,
+                        letter_spacing="-0.02em",
+                    ),
+                    spacing="2",
+                    align="center",
+                ),
+                rx.text(
+                    "Comparado con los 7 días previos",
+                    size="1",
+                    color=COLORS["muted"],
+                ),
+                accent=COLORS["success"],
+            ),
+            display="grid",
+            grid_template_columns=rx.breakpoints(
+                initial="1fr",
+                md="repeat(3, 1fr)",
+            ),
+            gap="0.9rem",
+            width="100%",
+        ),
+        spacing="3",
+        width="100%",
+        align="start",
+    )
+
+
+def _dash_mission_banner() -> rx.Component:
+    return rx.cond(
+        DashboardState.has_mision,
+        _card(
+            rx.hstack(
+                rx.center(
+                    rx.icon("target", size=22, color=COLORS["warning"]),
+                    width="48px",
+                    height="48px",
+                    border_radius="14px",
+                    background=COLORS["warning_bg"],
+                    border=f"1px solid {COLORS['warning_border']}",
+                    flex_shrink="0",
+                ),
+                rx.vstack(
+                    rx.text(
+                        "Misión de la semana",
+                        size="1",
+                        weight="bold",
+                        color=COLORS["warning"],
+                        letter_spacing="0.04em",
+                        text_transform="uppercase",
+                    ),
+                    rx.hstack(
+                        rx.text("Tu foco de esta semana:", size="3", color=COLORS["ink"]),
+                        rx.text(
+                            DashboardState.mision_tema,
+                            size="3",
+                            weight="bold",
+                            color=COLORS["ink"],
+                        ),
+                        spacing="1",
+                        flex_wrap="wrap",
+                    ),
+                    rx.text(
+                        "¡Súbelo del ",
+                        DashboardState.mision_desde,
+                        "% al ",
+                        DashboardState.mision_hasta,
+                        "%!",
+                        size="2",
+                        color=COLORS["slate"],
+                    ),
+                    rx.cond(
+                        DashboardState.mision_materia != "",
+                        rx.text(
+                            DashboardState.mision_materia,
+                            size="1",
+                            color=COLORS["muted"],
+                        ),
+                    ),
+                    spacing="1",
+                    align="start",
+                    flex="1",
+                    min_width="0",
+                ),
+                rx.button(
+                    rx.icon("dumbbell", size=16),
+                    "Practicar este tema",
+                    on_click=AppState.set_tab("practica"),
+                    color_scheme="amber",
+                    high_contrast=True,
+                    size="3",
+                    flex_shrink="0",
+                ),
+                width="100%",
+                align="center",
+                spacing="4",
+                flex_wrap="wrap",
+            ),
+            padding="1.15rem 1.25rem",
+            background=COLORS["warning_bg"],
+            border=f"1px solid {COLORS['warning_border']}",
+        ),
+        rx.fragment(),
+    )
+
+
+def _materia_row(m: rx.Var) -> rx.Component:
+    return rx.vstack(
+        rx.hstack(
+            rx.text(m["nombre"], size="2", weight="medium", color=COLORS["ink"]),
+            rx.spacer(),
+            rx.badge(m["dominio"], color_scheme=m["color_scheme"], variant="soft"),
+            width="100%",
+            align="center",
+        ),
+        rx.progress(
+            value=m["dominio_score"],
+            width="100%",
+            color_scheme=m["color_scheme"],
+            radius="full",
+            size="2",
+        ),
+        rx.hstack(
+            rx.text(
+                m["precision_label"],
+                " precisión",
+                size="1",
+                color=COLORS["muted"],
+            ),
+            rx.spacer(),
+            rx.text(
+                m["intentos"],
+                " intentos",
+                size="1",
+                color=COLORS["muted"],
+            ),
+            width="100%",
+        ),
+        spacing="1",
+        width="100%",
+        padding_y="0.55rem",
+        border_bottom=f"1px solid {COLORS['line']}",
+    )
+
+
+def _dash_materias() -> rx.Component:
+    return _card(
+        rx.vstack(
+            rx.hstack(
+                rx.icon("layers", size=18, color=COLORS["brand"]),
+                rx.heading("Dominio por materia", size="4", color=COLORS["ink"]),
+                spacing="2",
+                align="center",
+            ),
+            rx.text(
+                "Barras según precisión: priorizar · mejorar · fuerte.",
+                size="1",
+                color=COLORS["muted"],
+            ),
+            rx.cond(
+                DashboardState.materias_resumen.length() > 0,
+                rx.vstack(
+                    rx.foreach(DashboardState.materias_resumen, _materia_row),
+                    spacing="0",
+                    width="100%",
+                ),
+                rx.text(
+                    "Cuando practiques, aquí verás el dominio por materia.",
+                    size="2",
+                    color=COLORS["muted"],
+                ),
+            ),
+            spacing="3",
+            width="100%",
+            align="start",
+        ),
+        padding="1.15rem 1.25rem",
+        height="100%",
+    )
+
+
+def _actividad_row(a: rx.Var) -> rx.Component:
+    return rx.hstack(
+        rx.box(
+            width="4px",
+            height="100%",
+            min_height="40px",
+            border_radius="4px",
+            background=rx.cond(
+                a["color_scheme"] == "green",
+                COLORS["success"],
+                rx.cond(
+                    a["color_scheme"] == "amber",
+                    COLORS["warning"],
+                    COLORS["danger"],
+                ),
+            ),
+            flex_shrink="0",
+        ),
+        rx.vstack(
+            rx.text(a["tema"], size="2", weight="medium", color=COLORS["ink"]),
+            rx.hstack(
+                rx.text(a["materia"], size="1", color=COLORS["muted"]),
+                rx.text("·", size="1", color=COLORS["muted"]),
+                rx.text(a["cuando"], size="1", color=COLORS["muted"]),
+                spacing="1",
+                flex_wrap="wrap",
+            ),
+            rx.hstack(
+                rx.badge(
+                    a["precision_label"],
+                    color_scheme=a["color_scheme"],
+                    variant="soft",
+                    size="1",
+                ),
+                rx.text(
+                    a["intentos"],
+                    " intentos",
+                    size="1",
+                    color=COLORS["muted"],
+                ),
+                spacing="2",
+                align="center",
+            ),
+            spacing="1",
+            align="start",
+            flex="1",
+            min_width="0",
+        ),
+        width="100%",
+        align="stretch",
+        spacing="3",
+        padding_y="0.5rem",
+        border_bottom=f"1px solid {COLORS['line']}",
+    )
+
+
+def _dash_actividad() -> rx.Component:
+    return _card(
+        rx.vstack(
+            rx.hstack(
+                rx.icon("history", size=18, color=COLORS["brand"]),
+                rx.heading("Última actividad", size="4", color=COLORS["ink"]),
+                spacing="2",
+                align="center",
+            ),
+            rx.text(
+                "Temas que practicaste más recientemente.",
+                size="1",
+                color=COLORS["muted"],
+            ),
+            rx.cond(
+                DashboardState.actividad_reciente.length() > 0,
+                rx.vstack(
+                    rx.foreach(DashboardState.actividad_reciente, _actividad_row),
+                    spacing="0",
+                    width="100%",
+                ),
+                rx.text(
+                    "Tu cronología aparecerá aquí tras la primera práctica.",
+                    size="2",
+                    color=COLORS["muted"],
+                ),
+            ),
+            spacing="3",
+            width="100%",
+            align="start",
+        ),
+        padding="1.15rem 1.25rem",
+        height="100%",
+    )
+
+
+def dashboard_tab() -> rx.Component:
+    return _card(
+        rx.vstack(
+            _dash_header(),
             rx.cond(
                 DashboardState.error != "",
                 rx.callout(
@@ -1293,87 +1711,32 @@ def dashboard_tab() -> rx.Component:
             ),
             rx.cond(
                 DashboardState.empty,
-                rx.callout(
-                    "Aún no hay intentos. Completa una práctica o simulacro.",
-                    icon="info",
-                    color_scheme="blue",
-                    width="100%",
-                ),
+                _dash_empty(),
                 rx.vstack(
-                    rx.heading(
-                        DashboardState.indice,
-                        size="9",
-                        color=COLORS["brand"],
-                    ),
-                    rx.text(DashboardState.estado, weight="bold"),
-                    rx.text(DashboardState.frase, size="2", color=COLORS["muted"]),
-                    rx.badge(
-                        DashboardState.precision_pct,
-                        color_scheme="blue",
-                        variant="soft",
-                    ),
-                    rx.text(
-                        DashboardState.total_intentos,
-                        " intentos registrados",
-                        size="2",
-                        color=COLORS["muted"],
-                    ),
-                    rx.cond(
-                        DashboardState.cuello != "",
-                        rx.callout(
-                            DashboardState.cuello,
-                            icon="target",
-                            color_scheme="amber",
-                            width="100%",
+                    _dash_hero_metrics(),
+                    _dash_mission_banner(),
+                    rx.box(
+                        _dash_materias(),
+                        _dash_actividad(),
+                        display="grid",
+                        grid_template_columns=rx.breakpoints(
+                            initial="1fr",
+                            md="1.6fr 1fr",
                         ),
+                        gap="0.9rem",
+                        width="100%",
+                        align_items="start",
                     ),
-                    rx.text(DashboardState.mision, size="2"),
-                    rx.text("Nivel de Dominio por materia", size="2", weight="bold"),
-                    rx.foreach(
-                        DashboardState.materias_resumen,
-                        lambda m: rx.vstack(
-                            rx.hstack(
-                                rx.text(m["nombre"], size="2", weight="medium"),
-                                rx.spacer(),
-                                rx.badge(
-                                    m["dominio"],
-                                    color_scheme="blue",
-                                    variant="soft",
-                                ),
-                                width="100%",
-                            ),
-                            rx.hstack(
-                                rx.text(
-                                    m["precision"],
-                                    "% precisión",
-                                    size="1",
-                                    color=COLORS["muted"],
-                                ),
-                                rx.spacer(),
-                                rx.text(
-                                    m["intentos"],
-                                    " intentos",
-                                    size="1",
-                                    color=COLORS["muted"],
-                                ),
-                                width="100%",
-                            ),
-                            spacing="1",
-                            width="100%",
-                            padding_y="0.45rem",
-                            border_bottom=f"1px solid {COLORS['line']}",
-                        ),
-                    ),
-                    spacing="3",
+                    spacing="4",
                     width="100%",
                     align="start",
                 ),
             ),
-            spacing="3",
+            spacing="4",
             width="100%",
             align="start",
         ),
-        padding="1.25rem",
+        padding="1.35rem",
     )
 
 

@@ -417,5 +417,58 @@ class HistorialRepository:
             "precision_7d_prev": precision_7d_prev,
         }
 
+    def fetch_temas_recientes(
+        self, usuario_id: int, *, limit: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Últimos temas practicados por cronología real (MAX fecha_hora DESC).
+        """
+        lim = max(1, min(20, int(limit)))
+        query = """
+        SELECT
+            t.id_tema,
+            t.nombre AS tema_nombre,
+            m.id_materia,
+            m.nombre AS materia_nombre,
+            MAX(h.fecha_hora) AS ultimo_en,
+            COUNT(*)::int AS n_intentos,
+            COUNT(*) FILTER (WHERE h.es_correcta IS TRUE)::int AS correctas,
+            COUNT(*) FILTER (WHERE h.es_correcta IS FALSE)::int AS incorrectas
+        FROM historial_intentos h
+        JOIN banco_preguntas p ON p.id_pregunta = h.pregunta_id
+        JOIN temas_estudio t ON t.id_tema = p.tema_id
+        JOIN catalogo_materias m ON m.id_materia = t.materia_id
+        WHERE h.usuario_id = %s
+        GROUP BY t.id_tema, t.nombre, m.id_materia, m.nombre
+        ORDER BY ultimo_en DESC
+        LIMIT %s;
+        """
+        with self._connection.get_cursor() as cur:
+            cur.execute(query, (int(usuario_id), lim))
+            rows = [dict(r) for r in cur.fetchall()]
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            correctas = int(r.get("correctas") or 0)
+            incorrectas = int(r.get("incorrectas") or 0)
+            decididos = correctas + incorrectas
+            precision = (
+                round(100.0 * correctas / decididos, 1) if decididos > 0 else 0.0
+            )
+            out.append(
+                {
+                    "id_tema": int(r["id_tema"]),
+                    "tema_nombre": str(r.get("tema_nombre") or ""),
+                    "id_materia": int(r["id_materia"]),
+                    "materia_nombre": str(r.get("materia_nombre") or ""),
+                    "ultimo_en": r.get("ultimo_en"),
+                    "n_intentos": int(r.get("n_intentos") or 0),
+                    "correctas": correctas,
+                    "incorrectas": incorrectas,
+                    "precision_pct": precision,
+                }
+            )
+        return out
+
 
 historial_repository = HistorialRepository()
