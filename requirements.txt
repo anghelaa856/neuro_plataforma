@@ -1,41 +1,15 @@
-# Neuro Plataforma — dependencias para Hugging Face Spaces (SDK Streamlit)
-# Python 3.11 recomendado.
-
-# Core UI + config
-streamlit>=1.44.0
-extra-streamlit-components>=0.1.71,<0.2.0
+# Neuro Plataforma — Reflex + dominio Neon (Python 3.10+)
+reflex==0.9.7
 python-dotenv>=1.0.1
-
-# PostgreSQL (Neon) — binary obligatorio en Linux slim sin headers de libpq
 psycopg2-binary>=2.9.9
-# ORM opcional (runtime actual usa psycopg2 directamente)
-SQLAlchemy>=2.0.36
-
-# PDF — nativo + PyMuPDF (fitz) para PDFs sucios
-pypdf>=5.5.0
-pymupdf>=1.24.0
-
-# Imágenes / ingesta multimodal (Mis Guías: JPG/PNG → Base64 → OpenRouter visión)
-# Pillow: abrir, convertir RGB, redimensionar y exportar JPEG antes del data-URL.
 Pillow>=10.0.0
-
-# OCR (fallback escaneados). En Spaces sin poppler/tesseract el pipeline degrada a nativo.
-# Para OCR completo en Docker local: ver requirements-ocr.txt + packages del sistema.
-pdf2image>=1.17.0
-pytesseract>=0.3.10
-
-# OpenRouter (HTTP). Multimodal usa el mismo cliente; no se necesita el paquete `openai`.
-# base64 es stdlib — no requiere pip.
 requests>=2.32.0
 certifi>=2024.8.30
 truststore>=0.10.0
-
-# Analytics del TutorEngine / dashboard
+pypdf>=5.5.0
+pymupdf>=1.24.0
 numpy>=1.26.4
 pandas>=2.2.0
 scikit-learn>=1.5.2
-
-# Opcional en local (muy pesado para el plan gratis de Spaces).
-# Si lo necesitas en tu PC: pip install -r requirements-ml.txt
-# sentence-transformers>=3.2.1
-# torch>=2.4.1
+pdf2image>=1.17.0
+pytesseract>=0.3.10

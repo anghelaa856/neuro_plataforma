@@ -87,6 +87,8 @@ class ItemBancoGenerado:
     alternativas: AlternativasUNA
     alternativa_correcta: AlternativaKey
     justificacion: str
+    tag_tematico: str = ""
+    nivel_estimado: str = ""  # basica | intermedia | avanzada (solo revisión UI)
 
     def to_persist_dict(self) -> Dict[str, Any]:
         return {
@@ -97,6 +99,12 @@ class ItemBancoGenerado:
             "alternativa_correcta": self.alternativa_correcta,
             "justificacion": self.justificacion,
         }
+
+    def to_review_dict(self) -> Dict[str, Any]:
+        data = self.to_persist_dict()
+        data["tag_tematico"] = self.tag_tematico or self.tema_especifico
+        data["nivel_estimado"] = self.nivel_estimado or "intermedia"
+        return data
 
     @classmethod
     def from_raw(
@@ -124,6 +132,16 @@ class ItemBancoGenerado:
         )
         enunciado = " ".join(str(data.get("enunciado") or "").strip().split())
         justificacion = " ".join(str(data.get("justificacion") or "").strip().split())
+        tag = " ".join(str(data.get("tag_tematico") or data.get("tag") or "").strip().split())
+        nivel = str(data.get("nivel_estimado") or data.get("nivel") or "").strip().lower()
+        if nivel in {"básica", "basico", "básico"}:
+            nivel = "basica"
+        elif nivel in {"intermedio"}:
+            nivel = "intermedia"
+        elif nivel in {"avanzado"}:
+            nivel = "avanzada"
+        if nivel not in {"basica", "intermedia", "avanzada"}:
+            nivel = "intermedia"
 
         if len(tema) < 2 or len(tema) > 200:
             raise ItemValidationError("tema_especifico inválido (2–200 chars)")
@@ -149,6 +167,8 @@ class ItemBancoGenerado:
             alternativas=alts,
             alternativa_correcta=correcta,
             justificacion=justificacion,
+            tag_tematico=tag or tema,
+            nivel_estimado=nivel,
         )
 
 
@@ -219,7 +239,7 @@ class BancoIngestionResult:
     auto_clasificar: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
-        items = [x.to_persist_dict() for cr in self.chunk_results for x in cr.items]
+        items = [x.to_review_dict() for cr in self.chunk_results for x in cr.items]
         return {
             "materia_id": self.materia_id,
             "materia_nombre": self.materia_nombre,
@@ -242,6 +262,19 @@ class BancoIngestionResult:
 # ---------------------------------------------------------------------------
 
 _MAX_ITEMS_POR_CHUNK = 5
+# Techo duro para densidad alta (cuadrática puede pedir hasta este valor).
+_MAX_ITEMS_POR_CHUNK_HARD = 12
+
+# Vocabulario médico/biomédico aproximado para score de densidad local.
+_DENSITY_TERMS = (
+    "célula", "tejido", "órgano", "sistema", "anatomía", "fisiología",
+    "embriología", "histología", "patología", "metabolismo", "enzima",
+    "hormona", "neurona", "membrana", "núcleo", "mitocondria", "sangre",
+    "corazón", "pulmón", "hígado", "riñón", "hueso", "músculo", "nervio",
+    "arteria", "vena", "síndrome", "diagnóstico", "síntoma", "receptor",
+    "proteína", "adn", "arn", "gen", "cromosoma", "homeostasis", "ph",
+    "presión", "volumen", "concentración", "transporte", "sinapsis",
+)
 
 
 def _format_materias_oficiales(materias: Sequence[Dict[str, Any]]) -> str:
@@ -253,14 +286,78 @@ def _format_materias_oficiales(materias: Sequence[Dict[str, Any]]) -> str:
     return ", ".join(parts)
 
 
+def estimate_informational_density(text: str) -> float:
+    """
+    Score 0..1 de densidad conceptual (heurística local, pre-LLM).
+
+    Combina: longitud útil, diversidad léxica, términos biomédicos y
+    señales de contenido denso (números, fórmulas, listas).
+    """
+    raw = (text or "").strip()
+    if len(raw) < 40:
+        return 0.0
+
+    lower = raw.lower()
+    tokens = [t for t in "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in lower).split() if t]
+    if not tokens:
+        return 0.0
+
+    n = len(tokens)
+    unique = len(set(tokens))
+    lexical_div = unique / n
+
+    bio_hits = sum(1 for t in tokens if any(term in t for term in _DENSITY_TERMS))
+    bio_ratio = min(1.0, bio_hits / max(8, n * 0.12))
+
+    digit_ratio = sum(ch.isdigit() for ch in raw) / max(1, len(raw))
+    punct_dense = sum(ch in ":=→±%°/" for ch in raw) / max(1, len(raw))
+
+    length_factor = min(1.0, n / 220.0)
+
+    # Mezcla ponderada → 0..1
+    score = (
+        0.28 * length_factor
+        + 0.27 * lexical_div
+        + 0.30 * bio_ratio
+        + 0.10 * min(1.0, digit_ratio * 25)
+        + 0.05 * min(1.0, punct_dense * 40)
+    )
+    return float(max(0.0, min(1.0, score)))
+
+
+def adaptive_max_items_for_text(
+    text: str,
+    *,
+    hard_cap: int = _MAX_ITEMS_POR_CHUNK_HARD,
+) -> tuple[int, float]:
+    """
+    Curva cuadrática: items ≈ round(hard_cap * density²).
+
+    - densidad < 0.18 → 0 (relleno/carátula)
+    - densidad media → pocas MCQ
+    - densidad alta → hasta hard_cap
+    """
+    d = estimate_informational_density(text)
+    if d < 0.18:
+        return 0, d
+    curved = (d ** 2) * float(hard_cap)
+    n = int(round(curved))
+    n = max(1, min(int(hard_cap), n))
+    return n, d
+
+
 def build_banco_system_prompt(
     *,
     materias_oficiales: Sequence[Dict[str, Any]],
     temas_existentes: Optional[Sequence[str]] = None,
     materia_fija_nombre: Optional[str] = None,
     modo_imagen: bool = False,
+    max_items: int = _MAX_ITEMS_POR_CHUNK,
+    density_hint: Optional[float] = None,
+    dominio_por_materia: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> str:
     lista_materias = _format_materias_oficiales(materias_oficiales) or "(catálogo vacío)"
+    cap = max(0, min(int(max_items), _MAX_ITEMS_POR_CHUNK_HARD))
 
     temas = [t.strip() for t in (temas_existentes or []) if str(t).strip()]
     fuente_label = "esta foto del compendio" if modo_imagen else "este texto"
@@ -299,14 +396,24 @@ def build_banco_system_prompt(
             f"asigna cada ítem a la materia correcta según su contenido, no según {orden_hint}."
         )
 
+    density_note = ""
+    if density_hint is not None:
+        density_note = (
+            f" Heurística local de densidad informacional: {density_hint:.2f} "
+            f"(0=vacío, 1=muy denso). Ajusta el volumen de ítems con curva cuadrática "
+            f"hacia un máximo de {cap}."
+        )
+
     if modo_imagen:
         densidad_block = (
             "Analiza la densidad de información visible en la foto "
             "(texto impreso, apuntes, diagramas con rótulos legibles).\n"
-            f"- Genera entre 0 y {_MAX_ITEMS_POR_CHUNK} preguntas como máximo por foto,\n"
-            "  dependiendo de cuántos conceptos clave NUEVOS encuentres.\n"
+            f"- Genera entre 0 y {cap} preguntas como máximo por foto.\n"
+            "- Usa una escala NO lineal (cuadrática): poco contenido → 0–1 ítem; "
+            "contenido medio → 2–4; alta densidad conceptual → acercarte al máximo.\n"
             "- Si la imagen está borrosa, vacía o sin contenido académico, "
             "devuelve una lista vacía []."
+            + density_note
         )
         fidelidad_block = (
             "Basa cada ítem SOLO en lo legible en la imagen adjunta.\n"
@@ -316,20 +423,36 @@ def build_banco_system_prompt(
     else:
         densidad_block = (
             "Analiza la densidad de información de este fragmento de texto.\n"
-            f"- Genera entre 0 y {_MAX_ITEMS_POR_CHUNK} preguntas como máximo por fragmento,\n"
-            "  dependiendo de cuántos conceptos clave NUEVOS encuentres.\n"
+            f"- Genera entre 0 y {cap} preguntas como máximo por fragmento.\n"
+            "- Escala CUADRÁTICA / adaptativa: páginas de relleno o carátula → []; "
+            "texto narrativo ligero → pocas MCQ; alta densidad de conceptos médicos "
+            f"(definiciones, mecanismos, clasificaciones) → más ítems hasta {cap}.\n"
+            "- Prefiere calidad y cobertura de conceptos NUEVOS sobre relleno.\n"
             "- Si el texto es relleno o no aporta información útil, "
             "devuelve una lista vacía []."
+            + density_note
         )
         fidelidad_block = (
             "Basa cada ítem SOLO en el fragmento proporcionado.\n"
             "- No inventes datos clínicos, fechas, fórmulas o cifras ausentes en el texto."
         )
 
-    return f"""Eres un elaborador oficial de ítems del Examen de Admisión de la Universidad Nacional del Altiplano (UNA-Puno), Área Biomédicas.
+    try:
+        from app.services.student_dashboard_service import format_dominio_para_llm
+
+        dominio_block = format_dominio_para_llm(dominio_por_materia or [])
+    except Exception:
+        dominio_block = (
+            "PERFIL DE DOMINIO DEL ESTUDIANTE: no disponible. "
+            "Usa nivel intermedia por defecto."
+        )
+
+    return f"""Eres un elaborador oficial de ítems del Examen de Admisión de la Universidad Nacional del Altiplano (UNA-Puno), Área Biomédicas. Actúas como Tutor Inteligente Adaptativo: calibras la complejidad al dominio real del estudiante.
 
 MATERIAS OFICIALES (usa EXACTAMENTE uno de estos nombres en materia_nombre):
 [{lista_materias}]
+
+{dominio_block}
 
 Tu ÚNICA salida debe ser JSON válido (sin markdown, sin comentarios) con esta forma exacta:
 {{
@@ -337,6 +460,8 @@ Tu ÚNICA salida debe ser JSON válido (sin markdown, sin comentarios) con esta 
     {{
       "materia_nombre": "Biología y Anatomía",
       "tema_especifico": "nombre limpio del subtema (ej. Tejido epitelial)",
+      "tag_tematico": "etiqueta corta (ej. Osteología, Embriología)",
+      "nivel_estimado": "basica|intermedia|avanzada",
       "enunciado": "pregunta cerrada estilo ficha óptica UNA",
       "alternativas": {{
         "A": "...",
@@ -351,39 +476,14 @@ Tu ÚNICA salida debe ser JSON válido (sin markdown, sin comentarios) con esta 
   ]
 }}
 
-Si no hay conceptos nuevos útiles, responde exactamente: {{"items": []}}
-
-REGLAS INQUEBRANTABLES:
-
-1) FORMATO CERRADO OBLIGATORIO (ficha óptica UNA)
-- PROHIBIDO generar preguntas abiertas, de desarrollo, cloze sin opciones, o "explica con tus palabras".
-- Cada ítem DEBE tener exactamente 5 alternativas: A, B, C, D, E.
-- alternativa_correcta debe ser una sola letra: A|B|C|D|E.
-- Las distractoras deben ser plausibles (errores conceptuales frecuentes), no absurdas.
-
-2) AUTO-CLASIFICACIÓN POR MATERIA Y TEMA
+REGLAS:
 - {clasificacion_block}
-- PROHIBIDO inventar materias fuera de la lista (no uses "General", "Bloque", "Varios", "Cultura General").
-- Si el contenido es ambiguo, elige la materia oficial más cercana de la lista.
-- REGLA DE TEMAS: "tema_especifico" debe ser un concepto técnico directo (2–8 palabras),
-  SIN artículos (el, la, los, las, un, una) y SIN palabras de relleno.
-  Correctos: "Osmosis", "Tejido Epitelial", "Cinemática".
-  Incorrectos: "La osmosis", "El tejido", "Preguntas de fisica", "Tema de biología".
-- El nombre debe ser estable y reutilizable en la tabla temas_estudio.
-
-3) DELTA / EXCLUSIÓN DE TEMAS YA CUBIERTOS
 - {exclusion_block}
-
-4) DENSIDAD DE INFORMACIÓN (yield dinámico)
-- No tienes un límite fijo de preguntas.
 - {densidad_block}
-
-5) FIDELIDAD AL CONTENIDO
 - {fidelidad_block}
-
-6) CALIDAD DE ADMISIÓN
-- Estilo examen UNA: enunciado claro, una sola respuesta correcta, sin trampas de redacción ambigua.
-- justificacion: sólida, pedagógica, 2–5 oraciones.
+- Exactamente 5 alternativas A–E; una sola correcta.
+- Español claro, nivel preuniversitario biomédico UNA.
+- Respeta el PERFIL DE DOMINIO: no subestimes a un estudiante con alto dominio ni abrumes a un novato.
 """
 
 
@@ -469,6 +569,26 @@ class BancoExtractionService:
     def __init__(self, repository: Optional[BancoRepository] = None) -> None:
         self._repo = repository or banco_repository
 
+    @staticmethod
+    def _load_dominio_estudiante(usuario_id: Optional[int]) -> List[Dict[str, Any]]:
+        """KPI de dominio por materia para calibrar el prompt del LLM."""
+        if usuario_id is None:
+            return []
+        try:
+            from app.infrastructure.database.historial_repository import (
+                historial_repository,
+            )
+            from app.services.student_dashboard_service import (
+                enriquecer_resumen_con_dominio,
+                resumen_por_materia,
+            )
+
+            por_tema = historial_repository.fetch_rendimiento_por_tema(int(usuario_id))
+            return enriquecer_resumen_con_dominio(resumen_por_materia(por_tema))
+        except Exception as exc:
+            logger.warning("No se pudo cargar dominio del estudiante: %s", exc)
+            return []
+
     def extract_items_from_chunk(
         self,
         chunk_text: str,
@@ -479,6 +599,7 @@ class BancoExtractionService:
         temas_existentes: Optional[Sequence[str]] = None,
         max_items: int = _MAX_ITEMS_POR_CHUNK,
         materia_fija_nombre: Optional[str] = None,
+        dominio_por_materia: Optional[Sequence[Dict[str, Any]]] = None,
         # Compat firma antigua (ignorados)
         materia_id: Optional[int] = None,
         materia_nombre: Optional[str] = None,
@@ -495,11 +616,35 @@ class BancoExtractionService:
                 raw_error="Chunk demasiado corto (<40 chars).",
             )
 
-        cap = max(0, min(int(max_items), _MAX_ITEMS_POR_CHUNK))
+        cap = max(0, min(int(max_items), _MAX_ITEMS_POR_CHUNK_HARD))
+        if cap <= 0:
+            return ChunkExtractionResult(
+                chunk_index=chunk_index,
+                items=[],
+                raw_error="Densidad informacional baja: sin ítems para este fragmento.",
+            )
+
+        density = estimate_informational_density(chunk_text)
+        # Si el caller no forzó un cap bajo, adapta con curva cuadrática.
+        if int(max_items) >= _MAX_ITEMS_POR_CHUNK:
+            adaptive, density = adaptive_max_items_for_text(chunk_text)
+            cap = min(cap, adaptive) if adaptive else 0
+            if cap <= 0:
+                return ChunkExtractionResult(
+                    chunk_index=chunk_index,
+                    items=[],
+                    raw_error=(
+                        f"Densidad baja ({density:.2f}): fragmento omitido (relleno/carátula)."
+                    ),
+                )
+
         system_prompt = build_banco_system_prompt(
             materias_oficiales=materias_oficiales,
             temas_existentes=temas_existentes,
             materia_fija_nombre=materia_fija_nombre,
+            max_items=cap,
+            density_hint=density,
+            dominio_por_materia=dominio_por_materia,
         )
         user_prompt = build_banco_user_prompt(
             chunk_text=chunk_text,
@@ -546,6 +691,7 @@ class BancoExtractionService:
         max_items: int = _MAX_ITEMS_POR_CHUNK,
         materia_fija_nombre: Optional[str] = None,
         nombre_archivo: Optional[str] = None,
+        dominio_por_materia: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> ChunkExtractionResult:
         """Extrae MCQ desde una foto (visión multimodal OpenRouter)."""
         if not image_bytes:
@@ -555,12 +701,14 @@ class BancoExtractionService:
                 raw_error="Imagen vacía.",
             )
 
-        cap = max(0, min(int(max_items), _MAX_ITEMS_POR_CHUNK))
+        cap = max(0, min(int(max_items), _MAX_ITEMS_POR_CHUNK_HARD))
         system_prompt = build_banco_system_prompt(
             materias_oficiales=materias_oficiales,
             temas_existentes=temas_existentes,
             materia_fija_nombre=materia_fija_nombre,
             modo_imagen=True,
+            max_items=cap,
+            dominio_por_materia=dominio_por_materia,
         )
         user_prompt = build_banco_user_prompt_imagen(
             image_index=image_index,
@@ -679,6 +827,8 @@ class BancoExtractionService:
             logger.warning("No se pudieron cargar temas previos: %s", exc)
             temas_previos = []
 
+        dominio_ctx = self._load_dominio_estudiante(owner)
+
         temas_excluidos: List[str] = list(temas_previos)
         temas_excluidos_norm = {normalize_tema_nombre(t).lower() for t in temas_excluidos}
 
@@ -694,11 +844,16 @@ class BancoExtractionService:
             )
         else:
             warnings.append("Sin temas previos del dueño: extracción libre.")
+        if dominio_ctx:
+            warnings.append(
+                f"Motor de dominio: {len(dominio_ctx)} materia(s) con KPI "
+                "inyectadas al prompt (complejidad adaptativa)."
+            )
 
         chunk_results: List[ChunkExtractionResult] = []
         all_items: List[ItemBancoGenerado] = []
         archivo = (nombre_archivo_fuente or "").strip()[:255] or None
-        per_chunk = max(0, min(int(max_items_per_chunk), _MAX_ITEMS_POR_CHUNK))
+        per_chunk = max(0, min(int(max_items_per_chunk), _MAX_ITEMS_POR_CHUNK_HARD))
         total = len(chunk_list)
         fija_nombre = str(materia_fija["nombre"]) if materia_fija else None
 
@@ -719,6 +874,7 @@ class BancoExtractionService:
                 total_chunks=total,
                 temas_existentes=temas_excluidos,
                 materia_fija_nombre=fija_nombre,
+                dominio_por_materia=dominio_ctx,
             )
             chunk_results.append(result)
             if result.raw_error:
@@ -734,6 +890,8 @@ class BancoExtractionService:
                         alternativas=item.alternativas,
                         alternativa_correcta=item.alternativa_correcta,
                         justificacion=item.justificacion,
+                        tag_tematico=item.tag_tematico,
+                        nivel_estimado=item.nivel_estimado,
                     )
                 all_items.append(item)
                 key = normalize_tema_nombre(item.tema_especifico).lower()
@@ -857,6 +1015,8 @@ class BancoExtractionService:
             logger.warning("No se pudieron cargar temas previos: %s", exc)
             temas_previos = []
 
+        dominio_ctx = self._load_dominio_estudiante(owner)
+
         temas_excluidos: List[str] = list(temas_previos)
         temas_excluidos_norm = {normalize_tema_nombre(t).lower() for t in temas_excluidos}
 
@@ -874,11 +1034,16 @@ class BancoExtractionService:
             )
         else:
             warnings.append("Sin temas previos del dueño: extracción libre.")
+        if dominio_ctx:
+            warnings.append(
+                f"Motor de dominio: {len(dominio_ctx)} materia(s) con KPI "
+                "inyectadas al prompt (complejidad adaptativa)."
+            )
 
         chunk_results: List[ChunkExtractionResult] = []
         all_items: List[ItemBancoGenerado] = []
         archivo = (nombre_archivo_fuente or "").strip()[:255] or None
-        per_img = max(0, min(int(max_items_per_image), _MAX_ITEMS_POR_CHUNK))
+        per_img = max(0, min(int(max_items_per_image), _MAX_ITEMS_POR_CHUNK_HARD))
         total = len(image_list)
         fija_nombre = str(materia_fija["nombre"]) if materia_fija else None
 
@@ -914,6 +1079,7 @@ class BancoExtractionService:
                 temas_existentes=temas_excluidos,
                 materia_fija_nombre=fija_nombre,
                 nombre_archivo=nombre_img,
+                dominio_por_materia=dominio_ctx,
             )
             del raw_one
             gc.collect()
@@ -931,6 +1097,8 @@ class BancoExtractionService:
                         alternativas=item.alternativas,
                         alternativa_correcta=item.alternativa_correcta,
                         justificacion=item.justificacion,
+                        tag_tematico=item.tag_tematico,
+                        nivel_estimado=item.nivel_estimado,
                     )
                 all_items.append(item)
                 key = normalize_tema_nombre(item.tema_especifico).lower()

@@ -1,0 +1,54 @@
+# Puerto público único (HF Spaces → 7860). Internamente:
+#   frontend estático → /srv
+#   backend Reflex    → 127.0.0.1:8000  (/_event, /ping, uploads…)
+#
+# {$PORT} lo inyecta el entrypoint / Dockerfile (default 7860).
+
+{
+	auto_https off
+	admin off
+}
+
+:{$PORT:7860} {
+	encode gzip zstd
+
+	# Simulacros + subida de guías PDF pueden generar cuerpos grandes / waits largos
+	request_body {
+		max_size 64MB
+	}
+
+	@backend path /_event /_event/* /ping /_upload /_upload/* /_health /_all_routes /auth-codespace
+
+	handle @backend {
+		reverse_proxy 127.0.0.1:{$BACKEND_PORT:8000} {
+			# Ingesta OpenRouter / bloques largos: no cortar el WebSocket
+			transport http {
+				read_timeout 45m
+				write_timeout 45m
+				dial_timeout 10s
+			}
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+
+	header {
+		# Endurecimiento básico (HF ya termina TLS en el edge)
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

@@ -1,3 +1,6 @@
+.web
+assets/external/
+.states
 # Entornos virtuales
 .venv/
 venv/
@@ -8,6 +11,7 @@ ENV/
 .env
 .env.*
 !.env.example
+clave neon.txt
 
 # Python
 __pycache__/
@@ -32,8 +36,13 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Streamlit / local
-.streamlit/secrets.toml
+# Reflex
+.web/
+.states/
+.states_backup/
+*.db
+reflex.db
+uploaded_files/
 
 # Modelos / caches pesados
 .cache/

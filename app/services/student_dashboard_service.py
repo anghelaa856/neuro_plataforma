@@ -14,6 +14,136 @@ META_MEDICINA_IDEAL = 90.0
 BANDA_COMPETITIVA_MIN = 70.0
 # Muestra mínima para no presentar el índice como “verdad absoluta”.
 MUESTRA_CONFIABLE = 15
+# Umbral mínimo de intentos para confiar en el Nivel de Dominio por materia.
+DOMINIO_MUESTRA_MIN = 5
+
+
+def nivel_dominio(
+    precision_pct: float,
+    n_intentos: int,
+    *,
+    muestra_min: int = DOMINIO_MUESTRA_MIN,
+) -> Dict[str, Any]:
+    """
+    KPI de dominio evolutivo por materia (0–100 + banda pedagógica).
+
+    - novato / explorar: poca evidencia o baja precisión → MCQ básicas
+    - en_progreso: precisión media → intermedias + aplicación
+    - competente: ≥ banda competitiva → casos clínicos
+    - dominio: ≥ meta Medicina → análisis profundo / multi-paso
+    """
+    n = max(0, int(n_intentos or 0))
+    p = float(precision_pct or 0.0)
+    if n < max(1, int(muestra_min)):
+        # Evidencia insuficiente: score suave hacia novato/exploración.
+        score = round(min(35.0, p * 0.35 + n * 2.0), 1)
+        banda = "novato"
+        target = "basica"
+        hint = (
+            "Poca evidencia de dominio: genera ítems claros de recuerdo y "
+            "comprensión literal del material."
+        )
+    elif p < BANDA_COMPETITIVA_MIN:
+        score = round(p * 0.75, 1)
+        banda = "en_progreso"
+        target = "intermedia"
+        hint = (
+            "Dominio parcial: prioriza aplicación directa, discriminación de "
+            "conceptos cercanos y trampas típicas de admisión."
+        )
+    elif p < META_MEDICINA_MIN:
+        score = round(55.0 + (p - BANDA_COMPETITIVA_MIN) * 1.2, 1)
+        banda = "competente"
+        target = "avanzada"
+        hint = (
+            "Alto % de aciertos: elabora casos clínicos cortos, integración "
+            "fisiopatológica y alternativas técnicamente plausibles."
+        )
+    else:
+        score = round(min(100.0, 80.0 + (p - META_MEDICINA_MIN) * 1.5), 1)
+        banda = "dominio"
+        target = "avanzada"
+        hint = (
+            "Dominio alto: exige análisis profundo, razonamiento multi-paso, "
+            "excepciones clínicas y discriminación experta entre distractores."
+        )
+
+    return {
+        "score": float(score),
+        "banda": banda,
+        "target_nivel": target,
+        "precision_pct": round(p, 1),
+        "n_intentos": n,
+        "hint_llm": hint,
+        "etiqueta": f"{banda.replace('_', ' ').title()} ({score:.0f})",
+    }
+
+
+def enriquecer_resumen_con_dominio(
+    resumen_materias: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Añade Nivel de Dominio a cada fila de ``resumen_por_materia``."""
+    out: List[Dict[str, Any]] = []
+    for row in resumen_materias:
+        item = dict(row)
+        dom = nivel_dominio(
+            float(item.get("precision_pct") or 0.0),
+            int(item.get("n_intentos") or 0),
+        )
+        item["dominio_score"] = dom["score"]
+        item["dominio_banda"] = dom["banda"]
+        item["dominio_target"] = dom["target_nivel"]
+        item["dominio_etiqueta"] = dom["etiqueta"]
+        item["dominio_hint"] = dom["hint_llm"]
+        out.append(item)
+    return out
+
+
+def format_dominio_para_llm(
+    dominio_por_materia: Sequence[Dict[str, Any]],
+    *,
+    max_rows: int = 18,
+) -> str:
+    """Bloque de contexto para el prompt de extracción adaptativa."""
+    rows = [dict(r) for r in (dominio_por_materia or []) if r.get("materia_nombre")]
+    if not rows:
+        return (
+            "PERFIL DE DOMINIO DEL ESTUDIANTE: sin historial suficiente. "
+            "Calibra nivel_estimado en 'basica'/'intermedia' (exploración)."
+        )
+
+    # Priorizar materias con más evidencia / mayor dominio para calibrar complejidad.
+    rows.sort(
+        key=lambda r: (
+            -float(r.get("dominio_score") or 0.0),
+            -int(r.get("n_intentos") or 0),
+        )
+    )
+    lines: List[str] = []
+    for r in rows[: max(1, int(max_rows))]:
+        nombre = str(r.get("materia_nombre") or "")
+        banda = str(r.get("dominio_banda") or "novato")
+        score = float(r.get("dominio_score") or 0.0)
+        target = str(r.get("dominio_target") or "basica")
+        prec = float(r.get("precision_pct") or 0.0)
+        n = int(r.get("n_intentos") or 0)
+        hint = str(r.get("dominio_hint") or "")
+        lines.append(
+            f"- {nombre}: dominio={banda} ({score:.0f}/100), "
+            f"precisión={prec:.0f}% en {n} intentos → "
+            f"preferir nivel_estimado='{target}'. {hint}"
+        )
+
+    return (
+        "PERFIL DE DOMINIO DEL ESTUDIANTE (calibra la complejidad por materia):\n"
+        + "\n".join(lines)
+        + "\n"
+        "REGLA ADAPTATIVA: si el fragmento cae en una materia con banda "
+        "'competente' o 'dominio', las MCQ deben ser más elaboradas "
+        "(casos clínicos, análisis, integración). Si es 'novato'/'en_progreso', "
+        "mantén ítems claros y de comprensión directa. "
+        "Asigna nivel_estimado acorde a esa calibración."
+    )
 
 
 def recomendar_temas_urgentes(

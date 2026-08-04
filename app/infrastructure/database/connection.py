@@ -45,8 +45,8 @@ class DatabaseConnection:
         self._pool: Optional[ThreadedConnectionPool] = None
         self._init_lock = threading.RLock()
 
-    def connect(self, minconn: int = 1, maxconn: int = 3) -> None:
-        """Inicializa el pool una sola vez (Neon free tolera pocos sockets)."""
+    def connect(self, minconn: int | None = None, maxconn: int | None = None) -> None:
+        """Inicializa el pool una sola vez (Neon: preferir endpoint -pooler)."""
         with self._init_lock:
             if self._pool is not None and not getattr(self._pool, "closed", True):
                 return
@@ -60,12 +60,18 @@ class DatabaseConnection:
                     pass
                 self._pool = None
 
-            self._pool = ThreadedConnectionPool(minconn, maxconn, dsn=database_url)
+            # HF / multi-estudiante: PG_POOL_MAX (Secret). Neon pooler tolera más clients.
+            env_min = int(os.getenv("PG_POOL_MIN", "1") or 1)
+            env_max = int(os.getenv("PG_POOL_MAX", "12") or 12)
+            min_c = max(1, int(minconn if minconn is not None else env_min))
+            max_c = max(min_c, int(maxconn if maxconn is not None else env_max))
+
+            self._pool = ThreadedConnectionPool(min_c, max_c, dsn=database_url)
             parsed = urlparse(database_url)
             logger.info(
                 "Pool PostgreSQL (Threaded) listo host=%s maxconn=%s (DATABASE_URL)",
                 parsed.hostname or "?",
-                maxconn,
+                max_c,
             )
 
     def close(self) -> None:

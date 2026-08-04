@@ -1,0 +1,4 @@
+# Fuerza LF en scripts bash (crítico: contenedor Linux en HF Spaces)
+*.sh text eol=lf
+Caddyfile text eol=lf
+Dockerfile text eol=lf

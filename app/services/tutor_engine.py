@@ -306,6 +306,8 @@ class TutorEngine:
         """
         Bloque de estudio libre (sin cupos del prospecto).
 
+        Si ``materia_id`` y ``tema_id`` son None → Modo Global (mezcla todo el banco).
+
         Prioriza con historial_intentos:
           1) intervalos vencidos (SRS ligero desde último intento),
           2) alta tasa de error,
@@ -313,16 +315,21 @@ class TutorEngine:
         """
         uid = int(usuario_id)
         lim = max(1, int(limite))
-        if materia_id is None and tema_id is None:
-            raise ValueError("Indique materia_id y/o tema_id para la práctica enfocada.")
+        # materia_id/tema_id opcionales: ambos None = Modo Global (todo el banco).
+        mid = int(materia_id) if materia_id is not None else None
+        tid = int(tema_id) if tema_id is not None else None
+        if mid is not None and mid <= 0:
+            mid = None
+        if tid is not None and tid <= 0:
+            tid = None
 
         rng = np.random.default_rng(
             int(seed if seed is not None else random.SystemRandom().randint(1, 2**31 - 1))
         )
 
         banco = self._load_banco_activo(
-            materia_id=materia_id,
-            tema_id=tema_id,
+            materia_id=mid,
+            tema_id=tid,
             usuario_id=uid,
             fuente_banco=fuente_banco,
         )
@@ -335,6 +342,12 @@ class TutorEngine:
         ranked = self._rank_practica_srs(banco=banco, stats=stats, hoy=date.today(), rng=rng)
 
         top = ranked.head(min(lim, len(ranked)))
+        # Modo Global: remueve clustering temático del ranking SRS.
+        if mid is None and tid is None and len(top) > 1:
+            order = list(range(len(top)))
+            rng.shuffle(order)
+            top = top.iloc[order].reset_index(drop=True)
+
         preguntas: List[PreguntaTutor] = []
         resumen = {"vencidas": 0, "alta_error": 0, "nunca_vistas": 0, "refuerzo": 0}
 
@@ -365,15 +378,15 @@ class TutorEngine:
         logger.info(
             "Práctica enfocada usuario=%s materia=%s tema=%s n=%s resumen=%s",
             uid,
-            materia_id,
-            tema_id,
+            mid,
+            tid,
             len(preguntas),
             resumen,
         )
         return PracticaEnfocada(
             usuario_id=uid,
-            materia_id=int(materia_id) if materia_id is not None else None,
-            tema_id=int(tema_id) if tema_id is not None else None,
+            materia_id=mid,
+            tema_id=tid,
             limite=lim,
             total_preguntas=len(preguntas),
             preguntas=preguntas,
