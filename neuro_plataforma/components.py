@@ -376,7 +376,7 @@ def _option_bg(letter: str):
     return rx.cond(
         StudyState.answered,
         rx.cond(
-            StudyState.correct_answer == letter,
+            StudyState.revealed_correct == letter,
             COLORS["success_bg"],
             rx.cond(
                 StudyState.selected == letter,
@@ -396,7 +396,7 @@ def _option_border(letter: str):
     return rx.cond(
         StudyState.answered,
         rx.cond(
-            StudyState.correct_answer == letter,
+            StudyState.revealed_correct == letter,
             f"1.5px solid {COLORS['success_border']}",
             rx.cond(
                 StudyState.selected == letter,
@@ -416,7 +416,7 @@ def _option_color(letter: str):
     return rx.cond(
         StudyState.answered,
         rx.cond(
-            StudyState.correct_answer == letter,
+            StudyState.revealed_correct == letter,
             COLORS["success"],
             rx.cond(
                 StudyState.selected == letter,
@@ -528,7 +528,7 @@ def quiz_panel() -> rx.Component:
                                 ),
                             ),
                             rx.text(
-                                StudyState.explanation,
+                                StudyState.revealed_explanation,
                                 size="2",
                                 color=COLORS["slate"],
                             ),
@@ -591,6 +591,15 @@ def results_panel() -> rx.Component:
                 ),
                 spacing="2",
                 wrap="wrap",
+            ),
+            rx.cond(
+                StudyState.persist_status != "",
+                rx.callout(
+                    StudyState.persist_status,
+                    icon="database",
+                    color_scheme="green",
+                    width="100%",
+                ),
             ),
             rx.button(
                 "Volver al menú de estudio",

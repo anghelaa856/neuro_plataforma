@@ -17,7 +17,11 @@ def is_db_ready() -> bool:
 
 
 def bootstrap_database() -> bool:
-    """Conecta pool Neon + schema. Idempotente."""
+    """Conecta pool Neon + schema. Idempotente.
+
+    El tamaño del pool lo define ``connection.py`` vía ``PG_POOL_MIN`` /
+    ``PG_POOL_MAX`` (no hardcodear maxconn aquí).
+    """
     global _bootstrapped, _boot_error
     if _bootstrapped and not _boot_error:
         return True
@@ -28,7 +32,7 @@ def bootstrap_database() -> bool:
             seed_catalogo_materias,
         )
 
-        db_manager.connect(minconn=1, maxconn=3)
+        db_manager.connect()  # respeta PG_POOL_MIN / PG_POOL_MAX del entorno
         ensure_schema()
         try:
             seed_catalogo_materias()
@@ -68,18 +72,24 @@ def engine():
 
 
 def pregunta_to_public(p: Any) -> dict[str, Any]:
-    """Serializa PreguntaTutor sin filtrar clave (uso solo server-side / _vars)."""
+    """Serializa PreguntaTutor para _preguntas (server-side). Incluye clave remapeable."""
     alts = getattr(p, "alternativas", {}) or {}
     if not isinstance(alts, dict):
         alts = {}
     return {
         "id_pregunta": int(getattr(p, "id_pregunta", 0) or 0),
         "orden": int(getattr(p, "orden", 0) or 0),
+        "materia_id": int(getattr(p, "materia_id", 0) or 0),
+        "materia_codigo": int(getattr(p, "materia_codigo", 0) or 0),
         "materia_nombre": str(getattr(p, "materia_nombre", "") or ""),
+        "tema_id": int(getattr(p, "tema_id", 0) or 0),
         "tema_nombre": str(getattr(p, "tema_nombre", "") or ""),
         "enunciado": str(getattr(p, "enunciado", "") or ""),
         "alternativas": {k: str(alts.get(k, "")) for k in ("A", "B", "C", "D", "E")},
         "alternativa_correcta": str(
+            getattr(p, "alternativa_correcta", "") or ""
+        ).upper(),
+        "alternativa_correcta_banco": str(
             getattr(p, "alternativa_correcta", "") or ""
         ).upper(),
         "justificacion": "",

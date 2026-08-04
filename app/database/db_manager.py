@@ -25,8 +25,8 @@ from config.settings import settings
 class DatabaseManager:
     """Fachada pública: tarjetas + usuarios."""
 
-    def connect(self, minconn: int = 1, maxconn: int = 5) -> None:
-        """Abre el pool usando DATABASE_URL (link completo de Neon/PostgreSQL)."""
+    def connect(self, minconn: int | None = None, maxconn: int | None = None) -> None:
+        """Abre el pool; si min/max son None usa PG_POOL_MIN / PG_POOL_MAX."""
         database_url = (settings.database_url or os.getenv("DATABASE_URL", "")).strip()
         if not database_url:
             raise RuntimeError(

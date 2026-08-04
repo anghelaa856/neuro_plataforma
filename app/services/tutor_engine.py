@@ -644,6 +644,60 @@ class TutorEngine:
         )
         return intentos, resumen
 
+    def registrar_intento_practica(
+        self,
+        *,
+        usuario_id: int,
+        pregunta_id: int,
+        alternativa_marcada: Optional[str],
+        alternativa_correcta: str,
+        factor_ponderacion: float,
+        orden_en_sesion: Optional[int] = None,
+        tiempo_respuesta_ms: int = 0,
+        alternativa_marcada_banco: Optional[str] = None,
+    ) -> int:
+        """
+        INSERT incremental (1 fila) en historial_intentos con sesion_id=NULL.
+
+        Usado por Reflex en Práctica Enfocada tras cada ``check_answer``.
+        ``alternativa_marcada`` se evalúa vs ``alternativa_correcta`` (letras
+        ya remapeadas en UI). En el ledger se guarda preferentemente la letra
+        del banco (``alternativa_marcada_banco``) para auditoría.
+        """
+        eval_item = self.evaluar_alternativa(
+            alternativa_marcada=alternativa_marcada,
+            alternativa_correcta=alternativa_correcta,
+            factor_ponderacion=factor_ponderacion,
+        )
+        marcada_ledger = alternativa_marcada_banco
+        if marcada_ledger is None:
+            marcada_ledger = eval_item["alternativa_marcada"]
+        elif marcada_ledger is not None:
+            marcada_ledger = self._normalizar_marcada(marcada_ledger)
+
+        intento = IntentoLedger(
+            usuario_id=int(usuario_id),
+            pregunta_id=int(pregunta_id),
+            sesion_id=None,
+            orden_en_sesion=int(orden_en_sesion) if orden_en_sesion is not None else None,
+            tiempo_respuesta_ms=max(0, int(tiempo_respuesta_ms or 0)),
+            alternativa_marcada=marcada_ledger,
+            es_correcta=eval_item["es_correcta"],
+            puntaje_obtenido=int(eval_item["puntaje_obtenido"]),
+            factor_ponderacion_aplicado=float(factor_ponderacion),
+            puntaje_ponderado=float(eval_item["puntaje_ponderado"]),
+        )
+        ids = self._historial.insert_intentos([intento])
+        id_intento = int(ids[0]) if ids else 0
+        logger.info(
+            "Intento práctica usuario=%s pregunta=%s ok=%s id_intento=%s",
+            usuario_id,
+            pregunta_id,
+            eval_item["es_correcta"],
+            id_intento,
+        )
+        return id_intento
+
     def finalizar_practica_enfocada(
         self,
         *,

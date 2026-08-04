@@ -216,6 +216,17 @@ class StudyState(rx.State):
     check_ok: dict[str, bool] = {}
     feedback_inmediato: bool = True
 
+    # Revelación SOLO tras check en práctica (nunca @rx.var de la clave viva)
+    revealed_correct: str = ""
+    revealed_explanation: str = ""
+
+    # Persistencia incremental (práctica) / meta simulacro
+    _persisted_qids: dict[str, bool] = {}
+    _study_usuario_id: int = 0
+    _simulacro_usuario_id: int = 0
+    _simulacro_area: str = "BIOMEDICAS"
+    _simulacro_seed: int = 0
+
     # Resultado
     result_correctas: int = 0
     result_incorrectas: int = 0
@@ -224,6 +235,7 @@ class StudyState(rx.State):
     result_ponderado: float = 0.0
     result_aciertos_pct: int = 0
     result_titulo: str = ""
+    persist_status: str = ""
 
     # Simulacro meta
     simulacro_id_sesion: int = 0
@@ -237,8 +249,16 @@ class StudyState(rx.State):
         self.answers = {}
         self.comprobadas = {}
         self.check_ok = {}
+        self.revealed_correct = ""
+        self.revealed_explanation = ""
+        self._persisted_qids = {}
+        self._study_usuario_id = 0
+        self._simulacro_usuario_id = 0
+        self._simulacro_area = "BIOMEDICAS"
+        self._simulacro_seed = 0
         self.status_msg = ""
         self.error_msg = ""
+        self.persist_status = ""
         self.result_correctas = 0
         self.result_incorrectas = 0
         self.result_en_blanco = 0
@@ -321,17 +341,8 @@ class StudyState(rx.State):
     def is_correct(self) -> bool:
         return bool(self.check_ok.get(self._qid(), False))
 
-    @rx.var
-    def correct_answer(self) -> str:
-        if not self._preguntas:
-            return ""
-        return str(self._preguntas[self.index].get("alternativa_correcta", ""))
-
-    @rx.var
-    def explanation(self) -> str:
-        if not self._preguntas:
-            return ""
-        return str(self._preguntas[self.index].get("justificacion") or "")
+    # correct_answer / explanation eliminados como @rx.var (fuga en simulacro).
+    # Usar revealed_correct / revealed_explanation (solo tras check_answer en práctica).
 
     @rx.var
     def is_first(self) -> bool:
@@ -445,7 +456,26 @@ class StudyState(rx.State):
         self.answers = {}
         self.comprobadas = {}
         self.check_ok = {}
+        self.revealed_correct = ""
+        self.revealed_explanation = ""
+        self._persisted_qids = {}
+        self.persist_status = ""
         self.error_msg = ""
+
+    def _refresh_reveal_for_current(self):
+        """Restaura revelación solo si ya se comprobó en práctica."""
+        if not self.feedback_inmediato or not self._preguntas:
+            self.revealed_correct = ""
+            self.revealed_explanation = ""
+            return
+        qid = self._qid()
+        if not self.comprobadas.get(qid):
+            self.revealed_correct = ""
+            self.revealed_explanation = ""
+            return
+        q = self._preguntas[self.index]
+        self.revealed_correct = str(q.get("alternativa_correcta") or "")
+        self.revealed_explanation = str(q.get("justificacion") or "")
 
     @rx.event
     async def start_practica_local(self):
@@ -508,10 +538,12 @@ class StudyState(rx.State):
             )
             preguntas = [sb.pregunta_to_public(p) for p in practica.preguntas]
             preguntas = sb.hydrate_justificaciones(preguntas)
+            self._study_usuario_id = int(auth.usuario_id or 0)
             self._start_block(preguntas, mode="practica", feedback=True)
             modo = "Global" if mid is None and tid is None else "Enfocada"
             self.status_msg = (
-                f"Práctica {modo}: {len(preguntas)} ítems · opciones A–E mezcladas."
+                f"Práctica {modo}: {len(preguntas)} ítems · opciones A–E mezcladas · "
+                "progreso guardado por pregunta."
             )
         except Exception as exc:
             self.error_msg = str(exc)
@@ -535,9 +567,10 @@ class StudyState(rx.State):
             )
             preguntas = [sb.pregunta_to_public(p) for p in practica.preguntas]
             preguntas = sb.hydrate_justificaciones(preguntas)
+            self._study_usuario_id = int(auth.usuario_id or 0)
             self._start_block(preguntas, mode="practica", feedback=True)
             self.status_msg = (
-                f"Debilidades: {len(preguntas)} ítems · opciones A–E mezcladas."
+                f"Debilidades: {len(preguntas)} ítems · guardado incremental activo."
             )
         except Exception as exc:
             self.error_msg = str(exc)
@@ -564,11 +597,14 @@ class StudyState(rx.State):
             self.puntaje_maximo_ponderado = float(
                 getattr(simulacro, "puntaje_maximo_ponderado", 0) or 0
             )
+            self._simulacro_usuario_id = int(auth.usuario_id or 0)
+            self._simulacro_area = str(getattr(simulacro, "area_examen", "BIOMEDICAS") or "BIOMEDICAS")
+            self._simulacro_seed = int(getattr(simulacro, "seed_muestreo", 0) or 0)
             # Simulacro: sin feedback inmediato (integridad) + shuffle A–E
             self._start_block(preguntas, mode="simulacro", feedback=False)
             self.status_msg = (
                 f"Simulacro {len(preguntas)} Q · sesión #{self.simulacro_id_sesion} "
-                "· opciones A–E mezcladas"
+                "· opciones A–E mezcladas · evaluación al finalizar"
             )
         except Exception as exc:
             self.error_msg = str(exc)
@@ -591,6 +627,7 @@ class StudyState(rx.State):
 
     @rx.event
     def check_answer(self):
+        """Evalúa en práctica, revela feedback y encola persistencia incremental."""
         if not self.feedback_inmediato or self.phase != "quiz":
             return
         qid = self._qid()
@@ -599,19 +636,75 @@ class StudyState(rx.State):
         marcada = self.answers.get(qid)
         if not marcada:
             return
-        correcta = self._preguntas[self.index]["alternativa_correcta"]
-        es_ok = str(marcada).upper() == str(correcta).upper()
+        q = self._preguntas[self.index]
+        correcta = str(q.get("alternativa_correcta") or "")
+        es_ok = str(marcada).upper() == correcta.upper()
         comp = dict(self.comprobadas)
         ok_map = dict(self.check_ok)
         comp[qid] = True
         ok_map[qid] = es_ok
         self.comprobadas = comp
         self.check_ok = ok_map
+        # Revelación solo aquí (práctica). En simulacro feedback_inmediato=False.
+        self.revealed_correct = correcta
+        self.revealed_explanation = str(q.get("justificacion") or "")
+        return StudyState.persist_current_practica_intento
+
+    @rx.event(background=True)
+    async def persist_current_practica_intento(self):
+        """Guarda 1 intento en historial_intentos (SRS/debilidades) sin esperar finalize."""
+        async with self:
+            if self.mode != "practica" or self.phase != "quiz":
+                return
+            if not self._preguntas:
+                return
+            qid = self._qid()
+            if not qid or self._persisted_qids.get(qid):
+                return
+            if not self.comprobadas.get(qid):
+                return
+            marcada_display = self.answers.get(qid)
+            if not marcada_display:
+                return
+            q = dict(self._preguntas[self.index])
+            usuario_id = int(self._study_usuario_id or 0)
+            if usuario_id <= 0:
+                auth = await self.get_state(AuthState)
+                usuario_id = int(auth.usuario_id or 0)
+                self._study_usuario_id = usuario_id
+
+        if usuario_id <= 0 or not sb.is_db_ready():
+            return
+
+        # Remap display → letra del banco para el ledger
+        shuffle_map = q.get("shuffle_map") or {}
+        marcada_banco = shuffle_map.get(marcada_display, marcada_display)
+        try:
+            await asyncio.to_thread(
+                sb.engine().registrar_intento_practica,
+                usuario_id=usuario_id,
+                pregunta_id=int(q["id_pregunta"]),
+                alternativa_marcada=marcada_display,
+                alternativa_correcta=str(q.get("alternativa_correcta") or ""),
+                factor_ponderacion=float(q.get("factor_ponderacion") or 1.0),
+                orden_en_sesion=int(q.get("orden") or 0) or None,
+                tiempo_respuesta_ms=0,
+                alternativa_marcada_banco=marcada_banco,
+            )
+            async with self:
+                marked = dict(self._persisted_qids)
+                marked[qid] = True
+                self._persisted_qids = marked
+                self.persist_status = f"Guardado · pregunta #{qid}"
+        except Exception as exc:
+            async with self:
+                self.persist_status = f"No se pudo guardar intento: {exc}"
 
     @rx.event
     def go_prev(self):
         if self.index > 0:
             self.index -= 1
+            self._refresh_reveal_for_current()
 
     @rx.event
     def go_next(self):
@@ -620,48 +713,113 @@ class StudyState(rx.State):
         if self.index >= len(self._preguntas) - 1:
             return StudyState.finalize
         self.index += 1
+        self._refresh_reveal_for_current()
 
-    @rx.event
+    @staticmethod
+    def _preguntas_a_tutor(preguntas: list[dict[str, Any]]):
+        from app.services.tutor_engine import PreguntaTutor
+
+        out = []
+        for q in preguntas:
+            out.append(
+                PreguntaTutor(
+                    orden=int(q.get("orden") or 0),
+                    id_pregunta=int(q["id_pregunta"]),
+                    materia_id=int(q.get("materia_id") or 0),
+                    materia_codigo=int(q.get("materia_codigo") or 0),
+                    materia_nombre=str(q.get("materia_nombre") or ""),
+                    factor_ponderacion=float(q.get("factor_ponderacion") or 1.0),
+                    tema_id=int(q.get("tema_id") or 0),
+                    tema_nombre=str(q.get("tema_nombre") or ""),
+                    enunciado=str(q.get("enunciado") or ""),
+                    alternativas=dict(q.get("alternativas") or {}),
+                    # Usa la correcta YA remapeada (coherente con answers[display])
+                    alternativa_correcta=str(q.get("alternativa_correcta") or ""),
+                    peso_prioridad=0.0,
+                )
+            )
+        return out
+
+    @rx.event(background=True)
     async def finalize(self):
         if not self._preguntas:
             return
-        # Si práctica/simulacro con motor + Neon, preferir cierre oficial
-        auth = await self.get_state(AuthState)
-        if self.mode == "simulacro" and sb.is_db_ready() and self.simulacro_id_sesion:
-            try:
-                # Reconstruir objeto mínimo no es trivial; usamos scoring local
-                # coherente UNA y persistencia completa queda para iteración con
-                # el objeto SimulacroOficial vivo. Aquí calculamos resumen UNA.
-                pass
-            except Exception:
-                pass
 
-        resumen = evaluar_bloque(self._preguntas, dict(self.answers))
-        self.result_correctas = int(resumen["correctas"])
-        self.result_incorrectas = int(resumen["incorrectas"])
-        self.result_en_blanco = int(resumen["en_blanco"])
-        self.result_bruto = float(resumen["puntaje_bruto"])
-        self.result_ponderado = float(resumen["puntaje_ponderado"])
-        self.result_aciertos_pct = int(resumen["aciertos_pct"])
-        pct = self.result_aciertos_pct
-        if pct >= 75:
-            self.result_titulo = "¡Excelente rendimiento!"
-        elif pct >= 50:
-            self.result_titulo = "Buen avance"
+        async with self:
+            preguntas = [dict(q) for q in self._preguntas]
+            answers = dict(self.answers)
+            mode = self.mode
+            sesion_id = int(self.simulacro_id_sesion or 0)
+            uid_sim = int(self._simulacro_usuario_id or 0)
+            area = self._simulacro_area or "BIOMEDICAS"
+            seed = int(self._simulacro_seed or 0)
+            techo = float(self.puntaje_maximo_ponderado or 0)
+            auth = await self.get_state(AuthState)
+            if uid_sim <= 0:
+                uid_sim = int(auth.usuario_id or 0)
+
+        resumen: dict[str, Any]
+        persist_note = ""
+
+        if mode == "simulacro" and sb.is_db_ready() and sesion_id > 0 and uid_sim > 0:
+            try:
+                from app.services.tutor_engine import SimulacroOficial
+
+                # Respuestas para el motor: letras de DISPLAY (mismas que alternativa_correcta remapeada)
+                simulacro = SimulacroOficial(
+                    id_sesion=sesion_id,
+                    usuario_id=uid_sim,
+                    area_examen=area,
+                    seed_muestreo=seed,
+                    total_preguntas=len(preguntas),
+                    puntaje_maximo_ponderado=techo,
+                    preguntas=StudyState._preguntas_a_tutor(preguntas),
+                )
+                cierre = await asyncio.to_thread(
+                    sb.engine().finalizar_simulacro_oficial,
+                    simulacro=simulacro,
+                    respuestas=answers,
+                    tiempos_ms={},
+                )
+                total = max(1, int(cierre.correctas + cierre.incorrectas + cierre.en_blanco))
+                resumen = {
+                    "correctas": int(cierre.correctas),
+                    "incorrectas": int(cierre.incorrectas),
+                    "en_blanco": int(cierre.en_blanco),
+                    "puntaje_bruto": float(cierre.puntaje_bruto),
+                    "puntaje_ponderado": float(cierre.puntaje_ponderado),
+                    "aciertos_pct": int(round(100 * cierre.correctas / total)),
+                }
+                persist_note = f"Simulacro #{sesion_id} guardado ({cierre.n_insertados} intentos)."
+            except Exception as exc:
+                resumen = evaluar_bloque(preguntas, answers)
+                persist_note = f"Cierre local; fallo al persistir simulacro: {exc}"
         else:
-            self.result_titulo = "Sigue practicando"
-        self.phase = "results"
-        _ = auth  # reserved for ledger wiring
+            # Práctica: intentos ya fueron insertados incrementalmente.
+            resumen = evaluar_bloque(preguntas, answers)
+            if mode == "practica":
+                persist_note = (
+                    "Práctica: intentos guardados de forma incremental durante la sesión."
+                )
 
-        # Intentar persistir práctica vía motor si posible
-        if self.mode == "practica" and sb.is_db_ready() and auth.usuario_id:
-            try:
-                # Ledger detallado requiere objeto PracticaEnfocada;
-                # el resumen local ya alimenta la UX. Persistencia full:
-                # se encola como mejora — no bloquea UI.
-                pass
-            except Exception:
-                pass
+        async with self:
+            self.result_correctas = int(resumen["correctas"])
+            self.result_incorrectas = int(resumen["incorrectas"])
+            self.result_en_blanco = int(resumen["en_blanco"])
+            self.result_bruto = float(resumen["puntaje_bruto"])
+            self.result_ponderado = float(resumen["puntaje_ponderado"])
+            self.result_aciertos_pct = int(resumen["aciertos_pct"])
+            pct = self.result_aciertos_pct
+            if pct >= 75:
+                self.result_titulo = "¡Excelente rendimiento!"
+            elif pct >= 50:
+                self.result_titulo = "Buen avance"
+            else:
+                self.result_titulo = "Sigue practicando"
+            self.revealed_correct = ""
+            self.revealed_explanation = ""
+            self.persist_status = persist_note
+            self.phase = "results"
 
     @rx.event
     def back_to_setup(self):
@@ -672,6 +830,10 @@ class StudyState(rx.State):
         self.answers = {}
         self.comprobadas = {}
         self.check_ok = {}
+        self.revealed_correct = ""
+        self.revealed_explanation = ""
+        self._persisted_qids = {}
+        self.persist_status = ""
 
 
 # ---------------------------------------------------------------------------
