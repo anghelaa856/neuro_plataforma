@@ -532,6 +532,107 @@ def quiz_panel() -> rx.Component:
                                 size="2",
                                 color=COLORS["slate"],
                             ),
+                            # Coach IA: solo tras error, a petición (sin auto-gasto API)
+                            rx.cond(
+                                ~StudyState.is_correct,
+                                rx.vstack(
+                                    rx.cond(
+                                        StudyState.can_request_coach,
+                                        rx.button(
+                                            "Profundizar mi error con IA",
+                                            on_click=StudyState.request_error_coach,
+                                            variant="soft",
+                                            color_scheme="blue",
+                                            size="2",
+                                            width="100%",
+                                        ),
+                                    ),
+                                    rx.cond(
+                                        StudyState.coach_loading,
+                                        rx.hstack(
+                                            rx.spinner(size="1"),
+                                            rx.text(
+                                                "El tutor está razonando tu error…",
+                                                size="1",
+                                                color=COLORS["muted"],
+                                            ),
+                                            spacing="2",
+                                            align="center",
+                                            width="100%",
+                                            padding_y="0.35rem",
+                                        ),
+                                    ),
+                                    rx.cond(
+                                        StudyState.coach_error != "",
+                                        rx.text(
+                                            StudyState.coach_error,
+                                            size="1",
+                                            color=COLORS["danger"],
+                                        ),
+                                    ),
+                                    rx.cond(
+                                        StudyState.coach_visible,
+                                        rx.box(
+                                            rx.vstack(
+                                                rx.hstack(
+                                                    rx.badge(
+                                                        "Tutor IA",
+                                                        color_scheme="blue",
+                                                        variant="soft",
+                                                    ),
+                                                    rx.badge(
+                                                        StudyState.coach_nivel_label,
+                                                        color_scheme=rx.cond(
+                                                            StudyState.coach_nivel == 1,
+                                                            "green",
+                                                            rx.cond(
+                                                                StudyState.coach_nivel == 3,
+                                                                "red",
+                                                                "blue",
+                                                            ),
+                                                        ),
+                                                        variant="outline",
+                                                    ),
+                                                    rx.cond(
+                                                        StudyState.coach_kpi_fuente != "sesion",
+                                                        rx.badge(
+                                                            StudyState.coach_kpi_fuente,
+                                                            color_scheme="gray",
+                                                            variant="soft",
+                                                        ),
+                                                    ),
+                                                    rx.text(
+                                                        "Análisis de tu razonamiento",
+                                                        size="1",
+                                                        weight="medium",
+                                                        color=COLORS["brand"],
+                                                    ),
+                                                    spacing="2",
+                                                    align="center",
+                                                    flex_wrap="wrap",
+                                                ),
+                                                rx.text(
+                                                    StudyState.coach_text,
+                                                    size="2",
+                                                    color=COLORS["ink"],
+                                                    white_space="pre-wrap",
+                                                    line_height="1.55",
+                                                ),
+                                                spacing="2",
+                                                width="100%",
+                                            ),
+                                            padding="0.85rem",
+                                            border_radius="12px",
+                                            background=COLORS["brand_soft"],
+                                            border=f"1px solid {COLORS['brand_mid']}",
+                                            width="100%",
+                                        ),
+                                    ),
+                                    spacing="2",
+                                    width="100%",
+                                    padding_top="0.35rem",
+                                ),
+                            ),
                             spacing="2",
                             width="100%",
                         ),

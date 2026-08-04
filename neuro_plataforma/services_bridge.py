@@ -71,6 +71,12 @@ def engine():
     return tutor_engine
 
 
+def explicar_error_alumno(**kwargs: Any):
+    """Coach one-shot post-error (OpenRouter). Lazy import."""
+    from app.services.error_coach_service import explicar_error_alumno as _fn
+
+    return _fn(**kwargs)
+
 def pregunta_to_public(p: Any) -> dict[str, Any]:
     """Serializa PreguntaTutor para _preguntas (server-side). Incluye clave remapeable."""
     alts = getattr(p, "alternativas", {}) or {}

@@ -155,6 +155,25 @@ class ResultadoCierreBloque:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class KpiHistoricoAciertos:
+    """% de aciertos históricos (ventana deslizante) para calibrar Error Coach."""
+
+    usuario_id: int
+    intentos: int
+    correctas: int
+    precision_pct: float
+    segmento: str  # tema | materia | global | cold_start
+    tema_id: Optional[int]
+    materia_id: Optional[int]
+    cold_start: bool
+    ventana: int
+    minimo_muestra: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class TutorEngine:
     """
     Núcleo pedagógico: simulacro oficial (estratificado) + práctica libre (SRS).
@@ -697,6 +716,154 @@ class TutorEngine:
             id_intento,
         )
         return id_intento
+
+    def calcular_kpi_historico_aciertos(
+        self,
+        *,
+        usuario_id: int,
+        tema_id: Optional[int] = None,
+        materia_id: Optional[int] = None,
+        ventana: int = 100,
+        minimo_muestra: int = 10,
+    ) -> KpiHistoricoAciertos:
+        """
+        KPI histórico de precisión para tutoría adaptativa (Error Coach).
+
+        Auditoría de esquema (banco_preguntas):
+        - Existe ``tema_id`` (FK → temas_estudio); la materia se resuelve por JOIN
+          ``temas_estudio.materia_id`` → ``catalogo_materias``. No hay columna
+          ``categoria``/``curso`` en la pregunta.
+
+        Estrategia (cascada, una sola conexión del pool):
+        1) últimos ``ventana`` intentos decididos del **tema** de la pregunta
+        2) si n < minimo_muestra → mismos, filtrados por **materia**
+        3) si aún insuficiente → KPI **global** del alumno
+        4) si global < minimo_muestra → ``cold_start=True`` (UI usa % sesión)
+
+        Solo cuenta ``es_correcta IS NOT NULL`` (blancos fuera del %).
+        Usa ``get_cursor()`` una vez (borrow/return del pool Neon).
+        """
+        uid = int(usuario_id)
+        if uid <= 0:
+            raise ValueError("usuario_id inválido")
+
+        win = max(1, min(int(ventana), 500))
+        min_n = max(1, int(minimo_muestra))
+        tid = int(tema_id) if tema_id is not None and int(tema_id) > 0 else None
+        mid = int(materia_id) if materia_id is not None and int(materia_id) > 0 else None
+
+        # Un solo round-trip: stats tema + materia + global sobre últimas N filas
+        # de cada segmento (subqueries independientes, misma conexión).
+        #
+        # Futuro (opcional, rendimiento a escala): denormalizar tema_id/materia_id
+        # en historial_intentos al INSERT para evitar JOINs en hot path; hoy el
+        # JOIN vía banco_preguntas es correcto y ya indexado (pregunta_id, tema_id).
+        query = """
+        WITH
+        tema_win AS (
+            SELECT h.es_correcta
+            FROM historial_intentos h
+            JOIN banco_preguntas p ON p.id_pregunta = h.pregunta_id
+            WHERE h.usuario_id = %s
+              AND h.es_correcta IS NOT NULL
+              AND %s::bigint IS NOT NULL
+              AND p.tema_id = %s
+            ORDER BY h.fecha_hora DESC
+            LIMIT %s
+        ),
+        mat_win AS (
+            SELECT h.es_correcta
+            FROM historial_intentos h
+            JOIN banco_preguntas p ON p.id_pregunta = h.pregunta_id
+            JOIN temas_estudio t ON t.id_tema = p.tema_id
+            WHERE h.usuario_id = %s
+              AND h.es_correcta IS NOT NULL
+              AND %s::bigint IS NOT NULL
+              AND t.materia_id = %s
+            ORDER BY h.fecha_hora DESC
+            LIMIT %s
+        ),
+        glob_win AS (
+            SELECT h.es_correcta
+            FROM historial_intentos h
+            WHERE h.usuario_id = %s
+              AND h.es_correcta IS NOT NULL
+            ORDER BY h.fecha_hora DESC
+            LIMIT %s
+        )
+        SELECT
+            (SELECT COUNT(*)::int FROM tema_win) AS tema_n,
+            (SELECT COUNT(*) FILTER (WHERE es_correcta IS TRUE)::int FROM tema_win)
+                AS tema_ok,
+            (SELECT COUNT(*)::int FROM mat_win) AS mat_n,
+            (SELECT COUNT(*) FILTER (WHERE es_correcta IS TRUE)::int FROM mat_win)
+                AS mat_ok,
+            (SELECT COUNT(*)::int FROM glob_win) AS glob_n,
+            (SELECT COUNT(*) FILTER (WHERE es_correcta IS TRUE)::int FROM glob_win)
+                AS glob_ok;
+        """
+        params = (
+            uid,
+            tid,
+            tid if tid is not None else 0,
+            win,
+            uid,
+            mid,
+            mid if mid is not None else 0,
+            win,
+            uid,
+            win,
+        )
+
+        with self._connection.get_cursor() as cur:
+            cur.execute(query, params)
+            row = cur.fetchone() or {}
+
+        def _pack(
+            *,
+            n: int,
+            ok: int,
+            segmento: str,
+            cold: bool,
+        ) -> KpiHistoricoAciertos:
+            n = int(n or 0)
+            ok = max(0, min(int(ok or 0), n))
+            pct = round(100.0 * ok / n, 1) if n > 0 else 0.0
+            return KpiHistoricoAciertos(
+                usuario_id=uid,
+                intentos=n,
+                correctas=ok,
+                precision_pct=pct,
+                segmento=segmento,
+                tema_id=tid,
+                materia_id=mid,
+                cold_start=cold,
+                ventana=win,
+                minimo_muestra=min_n,
+            )
+
+        tema_n = int(row.get("tema_n") or 0)
+        tema_ok = int(row.get("tema_ok") or 0)
+        mat_n = int(row.get("mat_n") or 0)
+        mat_ok = int(row.get("mat_ok") or 0)
+        glob_n = int(row.get("glob_n") or 0)
+        glob_ok = int(row.get("glob_ok") or 0)
+
+        if tid is not None and tema_n >= min_n:
+            return _pack(n=tema_n, ok=tema_ok, segmento="tema", cold=False)
+        if mid is not None and mat_n >= min_n:
+            return _pack(n=mat_n, ok=mat_ok, segmento="materia", cold=False)
+        if glob_n >= min_n:
+            return _pack(n=glob_n, ok=glob_ok, segmento="global", cold=False)
+
+        # Cold start: devolver el mejor segmento parcial (para telemetría/UI)
+        if tid is not None and tema_n > 0:
+            return _pack(n=tema_n, ok=tema_ok, segmento="cold_start", cold=True)
+        if mid is not None and mat_n > 0:
+            return _pack(n=mat_n, ok=mat_ok, segmento="cold_start", cold=True)
+        if glob_n > 0:
+            return _pack(n=glob_n, ok=glob_ok, segmento="cold_start", cold=True)
+        return _pack(n=0, ok=0, segmento="cold_start", cold=True)
 
     def finalizar_practica_enfocada(
         self,

@@ -31,6 +31,7 @@ from app.services.tutor_engine import (
     SimulacroOficial,
     TutorEngine,
     tutor_engine,
+    KpiHistoricoAciertos,
 )
 from app.services.tutor_socratico_service import (
     ChatTurn,
@@ -38,6 +39,15 @@ from app.services.tutor_socratico_service import (
     SocraticTutorService,
     TutorContext,
     socratic_tutor_service,
+)
+from app.services.error_coach_service import (
+    ERROR_COACH_SYSTEM_PROMPT,
+    ErrorCoachReply,
+    NIVEL_TUTOR_LABELS,
+    build_error_coach_system_prompt,
+    calcular_nivel_desde_sesion,
+    explicar_error_alumno,
+    nivel_desde_precision_pct,
 )
 
 __all__ = [
@@ -68,9 +78,17 @@ __all__ = [
     "SimulacroOficial",
     "TutorEngine",
     "tutor_engine",
+    "KpiHistoricoAciertos",
     "TutorContext",
     "ChatTurn",
     "SocraticTutorReply",
     "SocraticTutorService",
     "socratic_tutor_service",
+    "ERROR_COACH_SYSTEM_PROMPT",
+    "ErrorCoachReply",
+    "NIVEL_TUTOR_LABELS",
+    "build_error_coach_system_prompt",
+    "calcular_nivel_desde_sesion",
+    "nivel_desde_precision_pct",
+    "explicar_error_alumno",
 ]

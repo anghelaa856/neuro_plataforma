@@ -220,6 +220,19 @@ class StudyState(rx.State):
     revealed_correct: str = ""
     revealed_explanation: str = ""
 
+    # Coach IA one-shot (solo tras error, a petición del alumno)
+    coach_loading: bool = False
+    coach_text: str = ""
+    coach_error: str = ""
+    coach_qid: str = ""
+    coach_nivel: int = 2
+    coach_nivel_label: str = "Nivel 2 · Intermedio"
+    coach_kpi_fuente: str = "sesion"  # sesion | tema | materia | global | cold_start
+    _coach_cache: dict[str, str] = {}
+    _coach_nivel_cache: dict[str, int] = {}
+    # KPI histórico por segmento (sesión): evita repetir SQL en cada coach call
+    _kpi_hist_cache: dict[str, dict[str, Any]] = {}
+
     # Persistencia incremental (práctica) / meta simulacro
     _persisted_qids: dict[str, bool] = {}
     _study_usuario_id: int = 0
@@ -251,6 +264,16 @@ class StudyState(rx.State):
         self.check_ok = {}
         self.revealed_correct = ""
         self.revealed_explanation = ""
+        self.coach_loading = False
+        self.coach_text = ""
+        self.coach_error = ""
+        self.coach_qid = ""
+        self.coach_nivel = 2
+        self.coach_nivel_label = "Nivel 2 · Intermedio"
+        self.coach_kpi_fuente = "sesion"
+        self._coach_cache = {}
+        self._coach_nivel_cache = {}
+        self._kpi_hist_cache = {}
         self._persisted_qids = {}
         self._study_usuario_id = 0
         self._simulacro_usuario_id = 0
@@ -458,24 +481,154 @@ class StudyState(rx.State):
         self.check_ok = {}
         self.revealed_correct = ""
         self.revealed_explanation = ""
+        self.coach_loading = False
+        self.coach_text = ""
+        self.coach_error = ""
+        self.coach_qid = ""
+        self.coach_nivel = 2
+        self.coach_nivel_label = "Nivel 2 · Intermedio"
+        self.coach_kpi_fuente = "sesion"
+        self._coach_cache = {}
+        self._coach_nivel_cache = {}
+        self._kpi_hist_cache = {}
         self._persisted_qids = {}
         self.persist_status = ""
         self.error_msg = ""
 
+    def _clear_coach_ui(self):
+        self.coach_loading = False
+        self.coach_text = ""
+        self.coach_error = ""
+        self.coach_qid = ""
+        self.coach_nivel = 2
+        self.coach_nivel_label = "Nivel 2 · Intermedio"
+        self.coach_kpi_fuente = "sesion"
+
+    def _set_coach_nivel_ui(self, nivel: int, *, fuente: str = "sesion"):
+        from app.services.error_coach_service import (
+            label_nivel_tutor,
+            normalize_nivel_tutor,
+        )
+
+        n = normalize_nivel_tutor(nivel)
+        self.coach_nivel = n
+        self.coach_nivel_label = label_nivel_tutor(n)
+        self.coach_kpi_fuente = str(fuente or "sesion")
+
+    def _nivel_tutor_sesion_actual(self) -> int:
+        """% aciertos de preguntas ya comprobadas en esta sesión → nivel 1|2|3."""
+        from app.services.error_coach_service import calcular_nivel_desde_sesion
+
+        comprobadas = sum(1 for v in self.comprobadas.values() if v)
+        correctas = sum(
+            1
+            for qid, done in self.comprobadas.items()
+            if done and self.check_ok.get(qid, False)
+        )
+        return calcular_nivel_desde_sesion(
+            comprobadas=comprobadas,
+            correctas=correctas,
+            minimo_muestra=2,
+        )
+
     def _refresh_reveal_for_current(self):
-        """Restaura revelación solo si ya se comprobó en práctica."""
+        """Restaura revelación + coach cacheado solo si ya se comprobó en práctica."""
         if not self.feedback_inmediato or not self._preguntas:
             self.revealed_correct = ""
             self.revealed_explanation = ""
+            self._clear_coach_ui()
             return
         qid = self._qid()
         if not self.comprobadas.get(qid):
             self.revealed_correct = ""
             self.revealed_explanation = ""
+            self._clear_coach_ui()
             return
         q = self._preguntas[self.index]
         self.revealed_correct = str(q.get("alternativa_correcta") or "")
         self.revealed_explanation = str(q.get("justificacion") or "")
+        cached = self._coach_cache.get(qid, "")
+        self.coach_qid = qid if cached else ""
+        self.coach_text = cached
+        self.coach_error = ""
+        self.coach_loading = False
+        if cached:
+            self._set_coach_nivel_ui(self._coach_nivel_cache.get(qid, 2))
+        else:
+            self._set_coach_nivel_ui(2)
+
+    async def _resolver_nivel_tutor_adaptativo(
+        self,
+        *,
+        usuario_id: int,
+        tema_id: int,
+        materia_id: int,
+        nivel_sesion: int,
+    ) -> tuple[int, str]:
+        """
+        KPI histórico (tema→materia→global) con fallback a % de sesión (cold start).
+        """
+        from app.services.error_coach_service import nivel_desde_precision_pct
+
+        if usuario_id <= 0 or not sb.is_db_ready():
+            return nivel_sesion, "sesion"
+
+        cache_key = f"u{usuario_id}|t{tema_id}|m{materia_id}"
+        async with self:
+            cached = self._kpi_hist_cache.get(cache_key)
+            if cached and not cached.get("cold_start", True):
+                return int(cached["nivel"]), str(cached.get("segmento") or "global")
+
+        try:
+            kpi = await asyncio.to_thread(
+                sb.engine().calcular_kpi_historico_aciertos,
+                usuario_id=usuario_id,
+                tema_id=tema_id if tema_id > 0 else None,
+                materia_id=materia_id if materia_id > 0 else None,
+                ventana=100,
+                minimo_muestra=10,
+            )
+        except Exception:
+            return nivel_sesion, "sesion"
+
+        cold = bool(getattr(kpi, "cold_start", True))
+        segmento = str(getattr(kpi, "segmento", "cold_start") or "cold_start")
+        if cold:
+            # < 10 intentos en tema/materia/global → rendimiento de la sesión
+            return nivel_sesion, "sesion"
+
+        nivel = nivel_desde_precision_pct(float(getattr(kpi, "precision_pct", 0.0)))
+        async with self:
+            hist = dict(self._kpi_hist_cache)
+            hist[cache_key] = {
+                "nivel": nivel,
+                "segmento": segmento,
+                "cold_start": False,
+                "precision_pct": float(getattr(kpi, "precision_pct", 0.0)),
+                "intentos": int(getattr(kpi, "intentos", 0)),
+            }
+            self._kpi_hist_cache = hist
+        return nivel, segmento
+
+    @rx.var
+    def coach_visible(self) -> bool:
+        return bool(self.coach_text) and self.coach_qid == self._qid()
+
+    @rx.var
+    def can_request_coach(self) -> bool:
+        """Solo práctica, tras error comprobado, sin carga activa."""
+        if not self.feedback_inmediato or self.phase != "quiz":
+            return False
+        qid = self._qid()
+        if not qid or not self.comprobadas.get(qid):
+            return False
+        if self.check_ok.get(qid, False):
+            return False
+        if self.coach_loading:
+            return False
+        if self.coach_text and self.coach_qid == qid:
+            return False
+        return True
 
     @rx.event
     async def start_practica_local(self):
@@ -648,7 +801,116 @@ class StudyState(rx.State):
         # Revelación solo aquí (práctica). En simulacro feedback_inmediato=False.
         self.revealed_correct = correcta
         self.revealed_explanation = str(q.get("justificacion") or "")
+        # Reset coach UI (el cache por qid evita rellamar OpenRouter si vuelve)
+        self.coach_loading = False
+        self.coach_error = ""
+        cached = self._coach_cache.get(qid, "")
+        self.coach_qid = qid if cached else ""
+        self.coach_text = cached
+        if cached:
+            self._set_coach_nivel_ui(self._coach_nivel_cache.get(qid, 2))
+        else:
+            self._set_coach_nivel_ui(2)
         return StudyState.persist_current_practica_intento
+
+    @rx.event(background=True)
+    async def request_error_coach(self):
+        """Genera coaching IA one-shot tras un error (OpenRouter, no bloquea UI)."""
+        async with self:
+            if not self.feedback_inmediato or self.phase != "quiz":
+                return
+            if not self._preguntas:
+                return
+            qid = self._qid()
+            if not qid or not self.comprobadas.get(qid):
+                return
+            if self.check_ok.get(qid, False):
+                return
+            if self.coach_loading:
+                return
+            cached = self._coach_cache.get(qid, "")
+            if cached:
+                self.coach_qid = qid
+                self.coach_text = cached
+                self.coach_error = ""
+                self._set_coach_nivel_ui(self._coach_nivel_cache.get(qid, 2))
+                return
+
+            nivel_sesion = self._nivel_tutor_sesion_actual()
+            marcada = self.answers.get(qid, "")
+            q = dict(self._preguntas[self.index])
+            usuario_id = int(self._study_usuario_id or 0)
+            tema_id = int(q.get("tema_id") or 0)
+            materia_id = int(q.get("materia_id") or 0)
+            self.coach_loading = True
+            self.coach_error = ""
+            self.coach_text = ""
+            self.coach_qid = qid
+            self._set_coach_nivel_ui(nivel_sesion, fuente="sesion")
+
+        if usuario_id <= 0:
+            auth = await self.get_state(AuthState)
+            usuario_id = int(auth.usuario_id or 0)
+
+        # KPI histórico consolidado; cold start → % sesión (ya calculado)
+        nivel_tutor, fuente = await self._resolver_nivel_tutor_adaptativo(
+            usuario_id=usuario_id,
+            tema_id=tema_id,
+            materia_id=materia_id,
+            nivel_sesion=nivel_sesion,
+        )
+        async with self:
+            self._set_coach_nivel_ui(nivel_tutor, fuente=fuente)
+            if usuario_id > 0:
+                self._study_usuario_id = usuario_id
+
+        alts = q.get("alternativas") or {}
+        tema = (
+            str(q.get("tema_nombre") or "").strip()
+            or str(q.get("materia_nombre") or "").strip()
+            or "Sin tema"
+        )
+        try:
+            reply = await asyncio.to_thread(
+                sb.explicar_error_alumno,
+                pregunta_id=int(q["id_pregunta"]),
+                enunciado=str(q.get("enunciado") or ""),
+                alternativas=dict(alts) if isinstance(alts, dict) else {},
+                alternativa_correcta=str(q.get("alternativa_correcta") or ""),
+                alternativa_alumno=str(marcada or ""),
+                justificacion=str(q.get("justificacion") or ""),
+                tema_o_materia=tema,
+                usuario_id=usuario_id if usuario_id > 0 else None,
+                nivel_tutor=nivel_tutor,
+            )
+            texto = str(getattr(reply, "texto", "") or "").strip()
+            if not texto:
+                raise RuntimeError("El tutor no devolvió texto")
+            nivel_resp = int(getattr(reply, "nivel_tutor", nivel_tutor) or nivel_tutor)
+            async with self:
+                cache = dict(self._coach_cache)
+                cache[qid] = texto
+                self._coach_cache = cache
+                ncache = dict(self._coach_nivel_cache)
+                ncache[qid] = nivel_resp
+                self._coach_nivel_cache = ncache
+                if self._qid() != qid:
+                    self.coach_loading = False
+                    return
+                self.coach_text = texto
+                self.coach_qid = qid
+                self.coach_error = ""
+                self.coach_loading = False
+                self._set_coach_nivel_ui(nivel_resp, fuente=fuente)
+                if usuario_id > 0:
+                    self._study_usuario_id = usuario_id
+        except Exception as exc:
+            async with self:
+                self.coach_loading = False
+                self.coach_error = (
+                    "No pude generar el coaching ahora. "
+                    f"Revisa la justificación oficial e inténtalo de nuevo. ({exc})"
+                )
 
     @rx.event(background=True)
     async def persist_current_practica_intento(self):
@@ -818,6 +1080,13 @@ class StudyState(rx.State):
                 self.result_titulo = "Sigue practicando"
             self.revealed_correct = ""
             self.revealed_explanation = ""
+            self.coach_loading = False
+            self.coach_text = ""
+            self.coach_error = ""
+            self.coach_qid = ""
+            self.coach_nivel = 2
+            self.coach_nivel_label = "Nivel 2 · Intermedio"
+            self.coach_kpi_fuente = "sesion"
             self.persist_status = persist_note
             self.phase = "results"
 
@@ -832,6 +1101,16 @@ class StudyState(rx.State):
         self.check_ok = {}
         self.revealed_correct = ""
         self.revealed_explanation = ""
+        self.coach_loading = False
+        self.coach_text = ""
+        self.coach_error = ""
+        self.coach_qid = ""
+        self.coach_nivel = 2
+        self.coach_nivel_label = "Nivel 2 · Intermedio"
+        self.coach_kpi_fuente = "sesion"
+        self._coach_cache = {}
+        self._coach_nivel_cache = {}
+        self._kpi_hist_cache = {}
         self._persisted_qids = {}
         self.persist_status = ""
 
