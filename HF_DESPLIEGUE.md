@@ -35,7 +35,7 @@ En el Space: **Settings → Variables and secrets → New secret**
 | `OPENROUTER_API_KEY` | Sí (Mis Guías) | `sk-or-v1-…` |
 | `OPENROUTER_MODEL` | No | p.ej. `openrouter/auto` |
 | `OPENROUTER_APP_NAME` | No | `Neuro Plataforma` |
-| `PUBLIC_APP_URL` | Recomendado | `https://<user>-<space>.hf.space` |
+| `PUBLIC_APP_URL` | Recomendado | `https://anghelaperez-neuro-plataforma.hf.space` (string limpio, **sin** markdown `[..](..)`) |
 | `PG_POOL_MAX` | No | `12` (sube con cuidado; mide límites Neon) |
 
 **No** subas `.env` al Space. Los Secrets se inyectan como variables de entorno

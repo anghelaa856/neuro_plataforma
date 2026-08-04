@@ -20,12 +20,40 @@ echo "[hf] Arranque Neuro Plataforma · PORT=${PORT} BACKEND=${BACKEND_PORT}"
 # ---------------------------------------------------------------------------
 # Origen público del Space (solo env vars; sin parsear con urllib)
 # Preferencia: PUBLIC_APP_URL → https://$SPACE_HOST → http://127.0.0.1:$PORT
+# Limpia formato Markdown accidental: [https://x](https://x) → https://x
 # ---------------------------------------------------------------------------
+sanitize_public_url() {
+  local u="${1:-}"
+  # Trim espacios/comillas
+  u="${u#"${u%%[![:space:]]*}"}"
+  u="${u%"${u##*[![:space:]]}"}"
+  u="${u#\'}"
+  u="${u%\'}"
+  u="${u#\"}"
+  u="${u%\"}"
+  # Markdown [texto](url) → url
+  if [[ "${u}" == \[*\]\(*\) ]]; then
+    u="${u##*](}"
+    u="${u%)}"
+  fi
+  # Remover brackets residuales
+  u="${u//\[/}"
+  u="${u//\]/}"
+  u="${u%/}"
+  printf '%s' "${u}"
+}
+
 if [[ -n "${PUBLIC_APP_URL:-}" ]]; then
-  # Quitar slash final si existe (%%/ elimina sufijo /)
-  PUBLIC_APP_URL="${PUBLIC_APP_URL%/}"
+  PUBLIC_APP_URL="$(sanitize_public_url "${PUBLIC_APP_URL}")"
 elif [[ -n "${SPACE_HOST:-}" ]]; then
-  PUBLIC_APP_URL="https://${SPACE_HOST}"
+  _host="$(sanitize_public_url "${SPACE_HOST}")"
+  # Si SPACE_HOST vino como URL completa, extraer hostname a mano
+  case "${_host}" in
+    https://*) _host="${_host#https://}" ;;
+    http://*)  _host="${_host#http://}" ;;
+  esac
+  _host="${_host%%/*}"
+  PUBLIC_APP_URL="https://${_host}"
 else
   PUBLIC_APP_URL="http://127.0.0.1:${PORT}"
 fi

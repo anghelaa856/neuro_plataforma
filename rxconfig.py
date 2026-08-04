@@ -23,11 +23,27 @@ def _is_production() -> bool:
     }
 
 
+def _strip_markdown_url(raw: str) -> str:
+    """Normaliza URLs pegadas como Markdown: [https://x](https://x) → https://x."""
+    text = (raw or "").strip().strip("`'\"")
+    # [label](https://…)  o  [https://…](https://…)
+    if text.startswith("[") and "](" in text and text.endswith(")"):
+        inner = text[text.rfind("](") + 2 : -1].strip()
+        if inner:
+            text = inner
+    # residuales por copiar mal el secret
+    text = text.replace("[", "").replace("]", "")
+    return text.strip().rstrip("/")
+
+
 def _public_app_url() -> str | None:
-    explicit = (os.getenv("PUBLIC_APP_URL") or "").strip().rstrip("/")
+    explicit = _strip_markdown_url(os.getenv("PUBLIC_APP_URL") or "")
     if explicit:
         return explicit
-    space_host = (os.getenv("SPACE_HOST") or "").strip()
+    space_host = _strip_markdown_url(os.getenv("SPACE_HOST") or "")
+    # SPACE_HOST debe ser solo hostname; si trajeron una URL, quedarnos con netloc
+    if space_host.startswith("http://") or space_host.startswith("https://"):
+        space_host = space_host.split("://", 1)[-1].split("/", 1)[0]
     if space_host:
         return f"https://{space_host}"
     return None
@@ -63,7 +79,9 @@ if IS_PROD:
     if PUBLIC_URL:
         API_URL = PUBLIC_URL
     else:
-        API_URL = (os.getenv("REFLEX_API_URL") or "http://localhost").strip().rstrip("/")
+        API_URL = _strip_markdown_url(
+            os.getenv("REFLEX_API_URL") or "http://localhost"
+        ) or "http://localhost"
     DEPLOY_URL = API_URL
     REDIS_URL = os.getenv("REFLEX_REDIS_URL", "redis://127.0.0.1:6379")
     STATE_MODE = "redis"
