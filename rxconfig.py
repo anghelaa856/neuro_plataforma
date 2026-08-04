@@ -46,11 +46,11 @@ if IS_PROD:
     PUBLIC_PORT = int(os.getenv("PORT", "7860"))  # solo Caddy
     BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
     FRONTEND_PORT = None
-    API_URL = (
-        PUBLIC_URL
-        or (os.getenv("REFLEX_API_URL") or "").strip().rstrip("/")
-        or f"http://127.0.0.1:{PUBLIC_PORT}"
-    )
+    # Nunca dejar el placeholder de build en api_url del backend.
+    _raw_api = (PUBLIC_URL or (os.getenv("REFLEX_API_URL") or "").strip().rstrip("/"))
+    if not _raw_api or "public_host" in _raw_api.lower() or "neuro-placeholder" in _raw_api.lower():
+        _raw_api = f"http://127.0.0.1:{PUBLIC_PORT}"
+    API_URL = _raw_api
     DEPLOY_URL = API_URL
     REDIS_URL = os.getenv("REFLEX_REDIS_URL", "redis://127.0.0.1:6379")
     STATE_MODE = "redis"

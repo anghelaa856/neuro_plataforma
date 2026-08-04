@@ -13,7 +13,8 @@
 # =============================================================================
 
 ARG PORT=7860
-# Placeholder de build: se reescribe en runtime con SPACE_HOST / PUBLIC_APP_URL.
+# Placeholder de build. Reflex lowercassea hostnames al armar wss://…
+# El entrypoint reemplaza __public_host__ / neuro-placeholder.invalid en runtime.
 ARG API_URL=https://__PUBLIC_HOST__
 
 # ---------------------------------------------------------------------------
