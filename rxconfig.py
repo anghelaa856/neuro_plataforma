@@ -46,19 +46,13 @@ if IS_PROD:
     PUBLIC_PORT = int(os.getenv("PORT", "7860"))  # solo Caddy
     BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
     FRONTEND_PORT = None
-    # Build/export: REFLEX_API_URL=http://localhost → frontend SAME_DOMAIN.
-    # Runtime HF: PUBLIC_URL / SPACE_HOST → CORS y backend con origen real.
-    _env_api = (os.getenv("REFLEX_API_URL") or "").strip().rstrip("/")
-    if PUBLIC_URL and "public_host" not in PUBLIC_URL.lower():
+    # Runtime: PUBLIC_APP_URL / SPACE_HOST (HTTPS del Space) para CORS del backend.
+    # Build/export: sin SPACE_HOST → http://localhost (SAME_DOMAIN en el cliente).
+    if PUBLIC_URL:
         API_URL = PUBLIC_URL
         CORS = [PUBLIC_URL]
-    elif _env_api and "public_host" not in _env_api.lower() and "_" not in (
-        _env_api.split("://", 1)[-1].split("/", 1)[0]
-    ):
-        API_URL = _env_api
-        CORS = ["*"] if "localhost" in API_URL or "127.0.0.1" in API_URL else [API_URL]
     else:
-        API_URL = "http://localhost"
+        API_URL = (os.getenv("REFLEX_API_URL") or "http://localhost").strip().rstrip("/")
         CORS = ["*"]
     DEPLOY_URL = API_URL
     REDIS_URL = os.getenv("REFLEX_REDIS_URL", "redis://127.0.0.1:6379")

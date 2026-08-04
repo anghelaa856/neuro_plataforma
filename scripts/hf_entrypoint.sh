@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Entrypoint Hugging Face Spaces
-# Caddy :$PORT  →  estáticos /srv  +  proxy backend :$BACKEND_PORT
+# Entrypoint Hugging Face Spaces — arranque mínimo (sin urllib / sin Python)
 # =============================================================================
-# Frontend exportado con api_url=http://localhost (ver Dockerfile).
-# Reflex 0.9.7 (getBackendURL) detecta hostname "localhost" en
-# SAME_DOMAIN_HOSTNAMES y lo sustituye por window.location (el Space real),
-# elevando ws→wss / http→https. NO hace falta sed/parche destructivo en .js.
+# Frontend (export Docker): REFLEX_API_URL=http://localhost
+#   → Reflex 0.9.7 getBackendURL reescribe "localhost" a window.location
+#     (SAME_DOMAIN_HOSTNAMES) y eleva ws→wss bajo HTTPS.
+# Runtime: solo exportamos CORS/API del backend y levantamos Redis+Caddy+Reflex.
 # =============================================================================
 set -euo pipefail
 
@@ -19,153 +18,33 @@ export REFLEX_REDIS_URL="${REFLEX_REDIS_URL:-redis://127.0.0.1:6379}"
 echo "[hf] Arranque Neuro Plataforma · PORT=${PORT} BACKEND=${BACKEND_PORT}"
 
 # ---------------------------------------------------------------------------
-# 1) Origen público absoluto (solo para CORS / OpenRouter / backend)
+# Origen público del Space (solo env vars; sin parsear con urllib)
+# Preferencia: PUBLIC_APP_URL → https://$SPACE_HOST → http://127.0.0.1:$PORT
 # ---------------------------------------------------------------------------
-resolve_public_url() {
-  local raw=""
-  if [[ -n "${PUBLIC_APP_URL:-}" ]]; then
-    raw="${PUBLIC_APP_URL}"
-  elif [[ -n "${SPACE_HOST:-}" ]]; then
-    raw="https://${SPACE_HOST}"
-  else
-    raw="http://127.0.0.1:${PORT}"
-  fi
-  # Normalizar: esquema http(s), sin slash final, sin ws/wss
-  raw="${raw%/}"
-  case "${raw}" in
-    wss://*) raw="https://${raw#wss://}" ;;
-    ws://*)  raw="http://${raw#ws://}" ;;
-  esac
-  # Si vino sin esquema, asumir https en Spaces
-  case "${raw}" in
-    http://*|https://*) ;;
-    *) raw="https://${raw}" ;;
-  esac
-  echo "${raw}"
-}
+if [[ -n "${PUBLIC_APP_URL:-}" ]]; then
+  # Quitar slash final si existe (%%/ elimina sufijo /)
+  PUBLIC_APP_URL="${PUBLIC_APP_URL%/}"
+elif [[ -n "${SPACE_HOST:-}" ]]; then
+  PUBLIC_APP_URL="https://${SPACE_HOST}"
+else
+  PUBLIC_APP_URL="http://127.0.0.1:${PORT}"
+fi
 
-PUBLIC_URL="$(resolve_public_url)"
-export PUBLIC_APP_URL="${PUBLIC_URL}"
-export REFLEX_API_URL="${PUBLIC_URL}"
-export OPENROUTER_SITE_URL="${OPENROUTER_SITE_URL:-${PUBLIC_URL}}"
+# Si alguien pasó wss:// por error, normalizar a https:// (bash puro)
+case "${PUBLIC_APP_URL}" in
+  wss://*) PUBLIC_APP_URL="https://${PUBLIC_APP_URL#wss://}" ;;
+  ws://*)  PUBLIC_APP_URL="http://${PUBLIC_APP_URL#ws://}" ;;
+esac
 
-python - <<'PY'
-"""Valida PUBLIC_APP_URL y sana solo env.json (nunca toca bundles .js)."""
-from __future__ import annotations
+export PUBLIC_APP_URL
+# Backend / CORS / OpenRouter (el frontend estático ya usa localhost→SAME_DOMAIN)
+export REFLEX_API_URL="${PUBLIC_APP_URL}"
+export OPENROUTER_SITE_URL="${OPENROUTER_SITE_URL:-${PUBLIC_APP_URL}}"
 
-import json
-import os
-import pathlib
-import sys
-from urllib.parse import urlparse
+echo "[hf] PUBLIC_APP_URL=${PUBLIC_APP_URL}"
+echo "[hf] REFLEX_API_URL=${REFLEX_API_URL}"
+echo "[hf] Frontend estático: http://localhost (SAME_DOMAIN → host del navegador)"
 
-public = (os.environ.get("PUBLIC_APP_URL") or "").strip().rstrip("/")
-parsed = urlparse(public)
-if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-    print(f"[hf] ERROR: PUBLIC_APP_URL inválida para getBackendURL/CORS: {public!r}", file=sys.stderr)
-    sys.exit(1)
-
-print(f"[hf] PUBLIC_APP_URL={public} (válida)")
-
-# Origen "localhost" que el cliente reescribe a window.location (SAME_DOMAIN)
-LOCAL_HTTP = "http://localhost"
-LOCAL_WS = "ws://localhost"
-
-MARKERS = ("public_host", "neuro-placeholder", "__public_host__", "__PUBLIC_HOST__")
-
-
-def is_absolute_http_or_ws(value: str) -> bool:
-    p = urlparse(value)
-    return p.scheme in {"http", "https", "ws", "wss"} and bool(p.netloc)
-
-
-def localize_endpoint(key: str, value: str) -> str:
-    """Convierte placeholders / URLs rotas a localhost absoluto (válido para new URL())."""
-    k = key.lower()
-    v = value or ""
-    path = urlparse(v).path if is_absolute_http_or_ws(v) else ""
-
-    if "event" in k or path.endswith("/_event") or "/_event" in v:
-        return f"{LOCAL_WS}/_event"
-    if "upload" in k or "/_upload" in v:
-        return f"{LOCAL_HTTP}/_upload"
-    if "ping" in k or v.endswith("/ping") or "/ping" in path:
-        return f"{LOCAL_HTTP}/ping"
-    if "health" in k or "/_health" in v:
-        return f"{LOCAL_HTTP}/_health"
-    if "all_routes" in k or "/_all_routes" in v:
-        return f"{LOCAL_HTTP}/_all_routes"
-    if "auth" in k:
-        return f"{LOCAL_HTTP}/auth-codespace"
-    if k in {"apiurl", "api_url", "deployurl", "deploy_url", "url"}:
-        return LOCAL_HTTP
-    return LOCAL_HTTP
-
-
-def needs_heal(value: str) -> bool:
-    if not value or not isinstance(value, str):
-        return True
-    low = value.lower()
-    if any(m.lower() in low for m in MARKERS):
-        return True
-    if not is_absolute_http_or_ws(value):
-        return True
-    host = urlparse(value).hostname or ""
-    if "_" in host:
-        return True
-    return False
-
-
-def heal_obj(data: dict) -> bool:
-    changed = False
-    for key, val in list(data.items()):
-        if isinstance(val, dict):
-            if heal_obj(val):
-                changed = True
-            continue
-        if not isinstance(val, str):
-            continue
-        if needs_heal(val):
-            new_v = localize_endpoint(str(key), val)
-            if new_v != val:
-                data[key] = new_v
-                changed = True
-                print(f"[hf] env.json[{key!r}]: {val!r} → {new_v!r}")
-    for key, default in (
-        ("apiUrl", LOCAL_HTTP),
-        ("deployUrl", LOCAL_HTTP),
-        ("EVENT", f"{LOCAL_WS}/_event"),
-        ("PING", f"{LOCAL_HTTP}/ping"),
-    ):
-        if key in data and isinstance(data[key], str) and needs_heal(data[key]):
-            data[key] = default
-            changed = True
-    return changed
-
-
-healed = 0
-for root in (pathlib.Path("/srv"), pathlib.Path("/app/.web")):
-    if not root.exists():
-        continue
-    for path in root.rglob("env.json"):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            print(f"[hf] skip {path}: {exc}", file=sys.stderr)
-            continue
-        if not isinstance(data, dict):
-            continue
-        if heal_obj(data):
-            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            healed += 1
-            print(f"[hf] env.json sanado (localhost SAME_DOMAIN): {path}")
-
-print(f"[hf] env.json sanados: {healed} · JS bundles: sin modificación")
-PY
-
-# ---------------------------------------------------------------------------
-# 2) Secrets (aviso, no aborta)
-# ---------------------------------------------------------------------------
 if [[ -z "${DATABASE_URL:-}" ]]; then
   echo "[hf] WARN: DATABASE_URL no está definida (Secrets del Space)."
 fi
@@ -174,7 +53,7 @@ if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3) Redis + Caddy + Reflex backend-only
+# Redis (state) + Caddy (puerto único) + Reflex backend-only
 # ---------------------------------------------------------------------------
 mkdir -p /tmp/redis /tmp/caddy "${HOME}/.local/share/reflex" || true
 
@@ -189,7 +68,7 @@ redis-server \
   --protected-mode yes \
   --loglevel notice
 
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   if redis-cli ping 2>/dev/null | grep -q PONG; then
     break
   fi
@@ -200,7 +79,6 @@ echo "[hf] Iniciando Caddy en :${PORT}…"
 caddy start --config /app/Caddyfile --adapter caddyfile
 
 echo "[hf] Iniciando Reflex backend-only en :${BACKEND_PORT}…"
-echo "[hf] REFLEX_API_URL=${REFLEX_API_URL}"
 unset REFLEX_FRONTEND_PORT || true
 export REFLEX_BACKEND_ONLY=1
 cd /app
