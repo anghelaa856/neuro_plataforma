@@ -33,27 +33,37 @@ def _public_app_url() -> str | None:
     return None
 
 
+def _cors_origins(*, production: bool) -> tuple[str, ...]:
+    """Orígenes CORS para Starlette + Engine.IO (WebSocket).
+
+    Crítico en Reflex 0.9.7 (reflex/app.py ~540):
+      Se pasa a AsyncServer el string \"*\" SOLO si
+      config.cors_allowed_origins == (\"*\",)  # tuple exacto
+    Una lista [\"*\"] se interpreta como origen literal \"*\" y el dominio
+    https://….hf.space recibe 403 (\"is not an accepted origin\").
+    """
+    del production  # mismo criterio local/prod detrás de proxy o LAN
+    return ("*",)
+
+
 IS_PROD = _is_production()
 PUBLIC_URL = _public_app_url()
+CORS_ALLOWED_ORIGINS = _cors_origins(production=IS_PROD)
 
 # Local: frontend 3005 / backend 8005 (dev).
 # Contenedor HF: Caddy publica :7860; Reflex corre SOLO backend en :8000.
-# Importante: en prod NO fijar frontend_port — Reflex 0.9.7 hace:
-#   frontend_port = cli_or_config.frontend_port
-# y aborta con "Cannot specify --frontend-port when not running frontend"
-# si se usa --backend-only con frontend_port distinto de None.
+# Importante: en prod NO fijar frontend_port — Reflex 0.9.7 aborta
+# \"Cannot specify --frontend-port when not running frontend\" con --backend-only.
 if IS_PROD:
     PUBLIC_PORT = int(os.getenv("PORT", "7860"))  # solo Caddy
     BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
     FRONTEND_PORT = None
-    # Runtime: PUBLIC_APP_URL / SPACE_HOST (HTTPS del Space) para CORS del backend.
+    # Runtime: PUBLIC_APP_URL / SPACE_HOST para api_url del backend.
     # Build/export: sin SPACE_HOST → http://localhost (SAME_DOMAIN en el cliente).
     if PUBLIC_URL:
         API_URL = PUBLIC_URL
-        CORS = [PUBLIC_URL]
     else:
         API_URL = (os.getenv("REFLEX_API_URL") or "http://localhost").strip().rstrip("/")
-        CORS = ["*"]
     DEPLOY_URL = API_URL
     REDIS_URL = os.getenv("REFLEX_REDIS_URL", "redis://127.0.0.1:6379")
     STATE_MODE = "redis"
@@ -65,7 +75,6 @@ else:
     DEPLOY_URL = os.getenv("REFLEX_DEPLOY_URL", "http://192.168.100.5:3005")
     REDIS_URL = os.getenv("REFLEX_REDIS_URL")  # opcional en local
     STATE_MODE = "redis" if REDIS_URL else "disk"
-    CORS = ["*"]
 
 
 _config_kwargs: dict = {
@@ -76,7 +85,8 @@ _config_kwargs: dict = {
     "api_url": API_URL,
     "deploy_url": DEPLOY_URL,
     "vite_allowed_hosts": True,
-    "cors_allowed_origins": CORS,
+    # Debe ser exactamente ("*",) para que Engine.IO acepte cualquier Origin HF
+    "cors_allowed_origins": CORS_ALLOWED_ORIGINS,
     "redis_url": REDIS_URL,
     "state_manager_mode": STATE_MODE,
     "show_built_with_reflex": (not IS_PROD)
